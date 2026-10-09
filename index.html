@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#1c1a17" />
+    <title>Book Reader</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎧</text></svg>" />
+    <link rel="stylesheet" href="./src/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <button id="menuBtn" class="icon-btn" aria-label="Chapters" hidden>☰</button>
+      <h1 id="bookTitle">Book Reader</h1>
+      <button id="homeBtn" class="icon-btn" aria-label="Library" hidden>⌂</button>
+    </header>
+
+    <main id="home" class="home">
+      <label class="drop" id="drop">
+        <input id="fileInput" type="file" accept=".pdf,.epub,application/pdf,application/epub+zip" hidden />
+        <span class="drop-icon">📖</span>
+        <strong>Open a PDF or EPUB</strong>
+        <span class="muted">Tap to choose a file, or drop it here. It stays on this device.</span>
+      </label>
+      <p id="homeError" class="error" hidden></p>
+      <section id="librarySection" hidden>
+        <h2>Your books</h2>
+        <ul id="library" class="library"></ul>
+      </section>
+    </main>
+
+    <div id="reader" class="reader" hidden>
+      <aside id="toc" class="toc">
+        <ol id="tocList"></ol>
+      </aside>
+      <div id="scrim" class="scrim"></div>
+      <article id="page" class="page"></article>
+    </div>
+
+    <footer id="player" class="player" hidden>
+      <div id="engineStatus" class="engine-status"></div>
+      <div class="controls">
+        <button id="prevBtn" class="icon-btn" aria-label="Previous sentence">⏮</button>
+        <button id="playBtn" class="play-btn" aria-label="Play">▶</button>
+        <button id="nextBtn" class="icon-btn" aria-label="Next sentence">⏭</button>
+      </div>
+      <div class="settings">
+        <select id="speedSel" aria-label="Speed">
+          <option value="0.75">0.75×</option>
+          <option value="1" selected>1×</option>
+          <option value="1.25">1.25×</option>
+          <option value="1.5">1.5×</option>
+          <option value="1.75">1.75×</option>
+          <option value="2">2×</option>
+        </select>
+        <select id="voiceSel" aria-label="Voice"></select>
+      </div>
+    </footer>
+
+    <script type="module" src="./src/main.js"></script>
+  </body>
+</html>
