@@ -189,7 +189,7 @@ button, select { font: inherit; color: inherit; }
   font-size: 1.2rem;
   cursor: pointer;
 }
-.settings { display: flex; gap: 8px; }
+.settings { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }
 .settings select {
   padding: 8px;
   border-radius: 8px;
@@ -210,7 +210,7 @@ button, select { font: inherit; color: inherit; }
   .toc-open .toc { transform: none; box-shadow: 4px 0 24px rgb(0 0 0 / 0.2); }
   .toc-open .scrim { display: block; position: absolute; inset: 0; background: rgb(0 0 0 / 0.3); z-index: 2; }
   .page { font-size: 1.08rem; }
-  .settings select { max-width: 150px; }
+  .settings select { max-width: 116px; }
 }
 @media (min-width: 761px) {
   #menuBtn { display: none; }

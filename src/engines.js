@@ -28,7 +28,7 @@ function toWav(samples, rate) {
 }
 
 export class KokoroEngine {
-  constructor({ onProgress, onReady, onError, onStatus }) {
+  constructor({ gpu = false, onProgress, onReady, onError, onStatus }) {
     this.worker = new Worker(new URL("./tts-worker.js", import.meta.url), { type: "module" });
     this.pending = new Map();
     this.cache = new Map(); // key -> Promise<blobUrl>
@@ -56,7 +56,14 @@ export class KokoroEngine {
         else p.resolve(URL.createObjectURL(toWav(m.samples, m.rate)));
       }
     };
-    this.worker.postMessage({ type: "load" });
+    this.worker.postMessage({ type: "load", gpu });
+  }
+
+  destroy() {
+    this.stop();
+    this.worker.terminate();
+    for (const p of this.pending.values()) p.reject(new Error("cancelled"));
+    this.pending.clear();
   }
 
   unlock() {

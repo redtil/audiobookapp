@@ -9,11 +9,11 @@ const els = {
   menuBtn: $("menuBtn"), homeBtn: $("homeBtn"), fileInput: $("fileInput"), drop: $("drop"),
   homeError: $("homeError"), library: $("library"), librarySection: $("librarySection"),
   playBtn: $("playBtn"), prevBtn: $("prevBtn"), nextBtn: $("nextBtn"),
-  speedSel: $("speedSel"), voiceSel: $("voiceSel"), status: $("engineStatus"),
+  speedSel: $("speedSel"), modeSel: $("modeSel"), voiceSel: $("voiceSel"), status: $("engineStatus"),
 };
 
 const DEFAULT_VOICE = "kokoro:af_heart";
-const settings = { voice: DEFAULT_VOICE, speed: 1, ...store.loadSettings() };
+const settings = { voice: DEFAULT_VOICE, speed: 1, gpu: false, ...store.loadSettings() };
 // Earlier builds could save a device voice the user never picked; start
 // everyone on the natural voice once.
 if (settings.v !== 2) {
@@ -48,8 +48,9 @@ function kokoroLabel(id) {
 
 function startKokoro() {
   if (kokoro || kokoroFailed) return;
-  setStatus("Downloading the natural voice (first time only)…");
+  setStatus("Loading the natural voice (the first time downloads it)…");
   kokoro = new KokoroEngine({
+    gpu: settings.gpu,
     onProgress: (loaded, total) => {
       if (total) setStatus(`Downloading the natural voice… ${Math.round((loaded / total) * 100)}%`);
     },
@@ -245,7 +246,7 @@ function prefetchAhead() {
   const eng = engine();
   if (!eng || eng !== kokoro) return;
   const keep = new Set();
-  for (let k = 0; k < 3; k++) {
+  for (let k = 0; k < 5; k++) {
     const s = state.sentences[state.i + k];
     if (!s) break;
     const key = keyFor(state.ch, state.i + k);
@@ -417,6 +418,20 @@ els.speedSel.addEventListener("change", () => {
   if (state.playing && engine() === device) jumpTo(state.ch, state.i);
 });
 device?.setRate(settings.speed);
+
+els.modeSel.value = settings.gpu ? "gpu" : "cpu";
+els.modeSel.addEventListener("change", () => {
+  settings.gpu = els.modeSel.value === "gpu";
+  store.saveSettings(settings);
+  const wasPlaying = state.playing;
+  stop();
+  kokoro?.destroy();
+  kokoro = null;
+  kokoroFailed = false;
+  startKokoro();
+  fillVoices();
+  if (wasPlaying) play();
+});
 
 els.voiceSel.addEventListener("change", () => {
   settings.voice = els.voiceSel.value;

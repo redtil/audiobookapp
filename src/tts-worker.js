@@ -30,11 +30,12 @@ async function loadOn(dev) {
   device = dev;
 }
 
-// Graphics-card acceleration is fastest but doesn't work on every device,
-// so fall back to the slower, universal WebAssembly path.
-async function load() {
+// The graphics card is faster but can freeze the whole browser on some
+// devices, so it is opt-in. The WebAssembly path runs on the CPU in this
+// worker and never blocks the page.
+async function load(useGpu) {
   let gpuError = null;
-  if (await hasWebGPU()) {
+  if (useGpu && (await hasWebGPU())) {
     try {
       await loadOn("webgpu");
     } catch (err) {
@@ -72,7 +73,7 @@ async function generate(msg) {
 self.onmessage = (e) => {
   const msg = e.data;
   if (msg.type === "load") {
-    load().catch((err) => self.postMessage({ type: "error", message: String(err?.message || err) }));
+    load(!!msg.gpu).catch((err) => self.postMessage({ type: "error", message: String(err?.message || err) }));
     return;
   }
   if (msg.type === "cancel") {
