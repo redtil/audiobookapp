@@ -1,4 +1,8 @@
-import { KokoroTTS } from "kokoro-js";
+import { KokoroTTS, env } from "kokoro-js";
+
+// Serve the ONNX runtime from this site instead of a CDN: it keeps working
+// with cross-origin isolation on, which lets it use several CPU cores.
+env.wasmPaths = new URL("../ort/", import.meta.url).href;
 
 const MODEL_ID = "onnx-community/Kokoro-82M-v1.0-ONNX";
 let tts = null;
@@ -52,11 +56,13 @@ async function load(useGpu) {
     }
   }
   self.postMessage({ type: "ready", device, voices: Object.keys(tts.voices) });
+  pump();
 }
 
-// Generation requests are processed one at a time, in order.
-let queue = Promise.resolve();
-const cancelled = new Set();
+// Pending requests, keyed by id. The page tells us which matter most
+// (the sentence about to be read first), and drops ones it no longer needs.
+const jobs = new Map(); // id -> { msg, priority }
+let pumping = false;
 
 async function generate(msg) {
   try {
@@ -70,19 +76,20 @@ async function generate(msg) {
   }
 }
 
-self.onmessage = (e) => {
-  const msg = e.data;
-  if (msg.type === "load") {
-    load(!!msg.gpu).catch((err) => self.postMessage({ type: "error", message: String(err?.message || err) }));
-    return;
-  }
-  if (msg.type === "cancel") {
-    cancelled.add(msg.id);
-    return;
-  }
-  if (msg.type === "generate") {
-    queue = queue.then(async () => {
-      if (cancelled.delete(msg.id)) return;
+async function pump() {
+  if (pumping) return;
+  pumping = true;
+  try {
+    while (jobs.size) {
+      // Let queued messages (cancels, new priorities) arrive before choosing.
+      await new Promise((r) => setTimeout(r, 0));
+      let best = null;
+      for (const [id, job] of jobs) {
+        if (!best || job.priority < best.job.priority) best = { id, job };
+      }
+      if (!best) break;
+      jobs.delete(best.id);
+      const { msg } = best.job;
       try {
         const audio = await generate(msg);
         const samples = audio.audio;
@@ -93,6 +100,25 @@ self.onmessage = (e) => {
       } catch (err) {
         self.postMessage({ type: "audio", id: msg.id, error: String(err?.message || err) });
       }
+    }
+  } finally {
+    pumping = false;
+  }
+}
+
+self.onmessage = (e) => {
+  const msg = e.data;
+  if (msg.type === "load") {
+    load(!!msg.gpu).catch((err) => self.postMessage({ type: "error", message: String(err?.message || err) }));
+  } else if (msg.type === "cancel") {
+    jobs.delete(msg.id);
+  } else if (msg.type === "order") {
+    msg.ids.forEach((id, i) => {
+      const job = jobs.get(id);
+      if (job) job.priority = i;
     });
+  } else if (msg.type === "generate") {
+    jobs.set(msg.id, { msg, priority: Number.MAX_SAFE_INTEGER - jobs.size });
+    if (tts) pump();
   }
 };

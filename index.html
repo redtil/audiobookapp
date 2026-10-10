@@ -7,6 +7,18 @@
     <title>Book Reader</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎧</text></svg>" />
     <link rel="stylesheet" href="./src/style.css" />
+    <script>
+      // Turn on cross-origin isolation (see coi-sw.js) so the voice can use
+      // multiple CPU cores. Reloads once the first time.
+      if (!window.crossOriginIsolated && window.isSecureContext && "serviceWorker" in navigator) {
+        navigator.serviceWorker.register("./coi-sw.js").then(() => {
+          if (!navigator.serviceWorker.controller && !sessionStorage.getItem("coi-reloaded")) {
+            sessionStorage.setItem("coi-reloaded", "1");
+            navigator.serviceWorker.ready.then(() => location.reload());
+          }
+        }, (err) => console.warn("Service worker unavailable", err));
+      }
+    </script>
   </head>
   <body>
     <header class="topbar">

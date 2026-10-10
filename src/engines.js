@@ -2,7 +2,8 @@
 //  - KokoroEngine: the natural-sounding open-source model, run in a worker.
 //  - DeviceEngine: the browser's built-in voices, used as a fallback.
 // Each exposes speak(text, key) -> Promise that resolves when the chunk
-// finishes playing, plus prefetch(text, key), stop(), setRate(rate).
+// finishes playing, plus stop() and setRate(rate). KokoroEngine also
+// has want(items) to generate upcoming sentences ahead of time.
 
 function toWav(samples, rate) {
   const buffer = new ArrayBuffer(44 + samples.length * 2);
@@ -121,8 +122,20 @@ export class KokoroEngine {
     return this.cache.get(fullKey);
   }
 
-  prefetch(text, key) {
-    this.fetch(text, key).catch(() => {});
+  // items: [{ text, key }] in reading order, starting with the current
+  // sentence. Queues what's missing, drops everything else, and tells the
+  // worker to generate them in this order.
+  want(items) {
+    const keep = new Set();
+    const ids = [];
+    for (const { text, key } of items) {
+      this.fetch(text, key);
+      const full = this.keyFull(key);
+      keep.add(full);
+      ids.push(this.keyIds.get(full));
+    }
+    this.trim(keep);
+    this.worker.postMessage({ type: "order", ids });
   }
 
   async speak(text, key, isCurrent) {
@@ -169,10 +182,6 @@ export class DeviceEngine {
   setVoice(name) {
     this.voiceName = name;
   }
-
-  prefetch() {}
-
-  trim() {}
 
   speak(text) {
     return new Promise((resolve) => {

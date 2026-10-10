@@ -216,7 +216,7 @@ export function toParagraphs(text) {
     const chunks = [];
     for (const s of sentences) {
       if (!s.trim()) continue;
-      if (s.length <= 350) chunks.push(s);
+      if (s.length <= 220) chunks.push(s);
       else chunks.push(...splitLong(s));
     }
     return chunks;
@@ -227,12 +227,12 @@ function splitLong(s) {
   const out = [];
   let cur = "";
   for (const part of s.split(/(?<=[,;:])\s+/)) {
-    if ((cur + " " + part).length > 300 && cur) {
+    if ((cur + " " + part).length > 160 && cur) {
       out.push(cur + " ");
       cur = part;
     } else cur = cur ? cur + " " + part : part;
   }
   if (cur) out.push(cur);
   // Hard-wrap anything still too long.
-  return out.flatMap((c) => (c.length > 400 ? c.match(/.{1,300}(\s|$)/g) : [c]));
+  return out.flatMap((c) => (c.length > 220 ? c.match(/.{1,160}(\s|$)/g) : [c]));
 }

@@ -58,6 +58,7 @@ function startKokoro() {
       setStatus("");
       fillVoices();
       if (settings.voice.startsWith("kokoro:")) kokoro.setVoice(settings.voice.slice(7));
+      prefetchAhead();
     },
     onStatus: (text) => setStatus(text),
     onError: (msg) => {
@@ -226,6 +227,7 @@ function setCurrent(i, scroll) {
   if (scroll) scrollIntoViewIfNeeded(cur.el);
   store.saveProgress(state.id, { ch: state.ch, i: state.i });
   updateMediaSession();
+  prefetchAhead();
 }
 
 function scrollIntoViewIfNeeded(el) {
@@ -242,18 +244,17 @@ function keyFor(ch, i) {
   return `${state.id}|${ch}|${i}`;
 }
 
+// Keep the natural voice working a few sentences ahead of the reader,
+// current sentence first. Runs while paused too, so a tap is ready fast.
 function prefetchAhead() {
-  const eng = engine();
-  if (!eng || eng !== kokoro) return;
-  const keep = new Set();
-  for (let k = 0; k < 5; k++) {
+  if (!kokoro?.ready || engine() !== kokoro || !state.book) return;
+  const items = [];
+  for (let k = 0; k < 6; k++) {
     const s = state.sentences[state.i + k];
     if (!s) break;
-    const key = keyFor(state.ch, state.i + k);
-    keep.add(eng.keyFull(key));
-    if (k > 0) eng.prefetch(s.text, key);
+    items.push({ text: s.text, key: keyFor(state.ch, state.i + k) });
   }
-  eng.trim(keep);
+  kokoro.want(items);
 }
 
 async function playLoop() {
@@ -283,7 +284,6 @@ async function playLoop() {
       return;
     }
     setCurrent(state.i, true);
-    prefetchAhead();
     if (eng === kokoro && els.status.textContent.startsWith("The natural voice is still")) setStatus("");
     try {
       await eng.speak(s.text, keyFor(state.ch, state.i), isCurrent);
@@ -437,7 +437,10 @@ els.voiceSel.addEventListener("change", () => {
   settings.voice = els.voiceSel.value;
   store.saveSettings(settings);
   const [kind, name] = [settings.voice.split(":")[0], settings.voice.slice(settings.voice.indexOf(":") + 1)];
-  if (kind === "kokoro") kokoro?.setVoice(name);
+  if (kind === "kokoro") {
+    kokoro?.setVoice(name);
+    prefetchAhead();
+  }
   else device?.setVoice(name);
   if (state.playing) jumpTo(state.ch, state.i);
 });
