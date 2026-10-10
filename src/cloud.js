@@ -177,7 +177,7 @@ export class Library {
 
 // ---------- merging (pure) ----------
 // Entry: { id, title, chapters, total, chars, addedAt, deletedAt,
-//          voice, ready, seconds, readyAt,
+//          voice, ready, seconds, audioAt, startedAt, eta: { at, seconds },
 //          pos: { ch, i, at }, finished, finishedAt }
 
 const newer = (a, b, key) => ((a?.[key] || 0) >= (b?.[key] || 0) ? a : b);
@@ -198,6 +198,8 @@ function mergeEntry(a, b) {
     ready: audio.ready,
     seconds: audio.seconds,
     audioAt: audio.audioAt,
+    eta: audio.eta,
+    startedAt: audio.startedAt,
     deletedAt: Math.max(a.deletedAt || 0, b.deletedAt || 0) || undefined,
   };
 }

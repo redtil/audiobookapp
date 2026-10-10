@@ -4,6 +4,7 @@ import { Library, mergeLibraries, isRemoved } from "./cloud.js";
 import { Player } from "./player.js";
 import { VOICES, voiceLabel } from "./voices.js";
 import { formatTime, formatDuration } from "./format.js";
+import { estimateSeconds } from "./plan.js";
 
 const $ = (id) => document.getElementById(id);
 const el = new Proxy({}, { get: (_, id) => $(id) });
@@ -127,6 +128,24 @@ async function syncNow() {
 
 const chapterSizes = (b) => b.chapters.map((c) => c.paras.reduce((n, p) => n + p.reduce((m, s) => m + s.length, 0), 0));
 
+// When the server should be done: estimated from the book's size and how
+// fast GitHub's machines are, counted from when preparing started.
+function estimateFor(e, index = {}) {
+  const sizes = e.sizes || [];
+  const todo = sizes.map((_, ch) => ch).filter((ch) => !index[ch]);
+  return { at: Date.now(), seconds: Math.round(estimateSeconds(sizes, todo)) };
+}
+
+function secondsLeft(e) {
+  if (!e?.eta) return null;
+  return Math.max(0, (e.eta.at + e.eta.seconds * 1000 - Date.now()) / 1000);
+}
+
+function countdown(sec) {
+  if (sec == null) return "";
+  return sec < 1 ? "finishing up" : `${formatTime(sec)} left`;
+}
+
 // How far along a book's audio is, from the chapters on the server and any
 // preparation running now.
 async function refreshStatus(id, runs) {
@@ -149,6 +168,10 @@ async function refreshStatus(id, runs) {
     failed: !running && !starting && run?.conclusion === "failure",
     startedAt: run?.run_started_at ? Date.parse(run.run_started_at) : e.startedAt,
   };
+  if (status[id].running && !e.eta) {
+    e.eta = { ...estimateFor(e, index), at: status[id].startedAt || Date.now() };
+    db.saveLibrary(library);
+  }
   if (made === e.chapters && e.chapters > 0) await markReady(id, index);
   return status[id];
 }
@@ -162,7 +185,7 @@ async function markReady(id, index) {
       return 0;
     }
   }));
-  updateEntry(id, { ready: true, seconds: durations.reduce((a, b) => a + b, 0), startedAt: 0, audioAt: Date.now() }, 500);
+  updateEntry(id, { ready: true, seconds: durations.reduce((a, b) => a + b, 0), startedAt: 0, eta: null, audioAt: Date.now() }, 500);
   const rec = await db.getBook(id);
   if (rec) await db.putBook({ ...rec, index });
   if (book?.id === id) book.index = index;
@@ -218,7 +241,10 @@ function renderBooks() {
     } else if (!st && !e.voice) tags.push(`<span class="tag">Not prepared yet</span>`);
     else if (!st) tags.push(`<span class="tag">Checking…</span>`);
     else if (!st.running && !st.made && !e.voice) tags.push(`<span class="tag">Not prepared yet</span>`);
-    else if (st.running) tags.push(`<span class="tag busy">Preparing · ${pct}%</span>`);
+    else if (st.running) {
+      const left = secondsLeft(e);
+      tags.push(`<span class="tag busy">Preparing · ${pct}%${left ? ` · ${formatDuration(left)} left` : ""}</span>`);
+    }
     else if (st.failed) tags.push(`<span class="tag">Stopped at ${pct}% · open to continue</span>`);
     else tags.push(`<span class="tag">Paused · ${pct}%</span>`);
     return `<li>
@@ -469,7 +495,8 @@ async function startPreparing(voice) {
     }
     return;
   }
-  updateEntry(id, { voice, startedAt: Date.now(), ready: false, audioAt: Date.now() }, 0);
+  const eta = estimateFor(entry(id), status[id]?.index);
+  updateEntry(id, { voice, startedAt: Date.now(), eta, ready: false, audioAt: Date.now() }, 0);
   status[id] = { index: {}, made: 0, done: 0, ...status[id], running: true, failed: false, startedAt: Date.now() };
   await syncNow(); // so other devices see it straight away, even if this one closes
   if (book?.id === id) showBookState();
@@ -485,8 +512,15 @@ el.prepareBtn.addEventListener("click", async () => {
 
 // ---------- preparing ----------
 
+let workTicker = null;
 function showWork() {
   showPanel("work");
+  clearInterval(workTicker);
+  workTicker = setInterval(() => {
+    if (el.workPanel.hidden || !book) return clearInterval(workTicker);
+    const left = secondsLeft(entry(book.id));
+    if (status[book.id]?.running && left != null) el.workPct.textContent = countdown(left);
+  }, 1000);
   const e = entry(book.id);
   const st = status[book.id];
   el.workPct.textContent = st ? `${Math.floor(st.done * 100)}%` : "";
@@ -497,9 +531,9 @@ function showWork() {
   if (st) {
     const chapters = `${st.made} of ${e.chapters} chapters ready`;
     if (running) {
-      const elapsed = (Date.now() - (st.startedAt || Date.now())) / 1000;
-      const left = st.done > 0.05 ? (elapsed * (1 - st.done)) / st.done : null;
-      info = `${chapters}${left ? ` · about ${formatDuration(left)} left` : st.made ? "" : " · starting up"}. ` +
+      const left = secondsLeft(e);
+      el.workPct.textContent = left == null ? el.workPct.textContent : countdown(left);
+      info = `${Math.floor(st.done * 100)}% · ${chapters}. Chapters finish in batches, so this jumps ahead in steps. ` +
         "It keeps going on the server, even if you close the app.";
     } else {
       info = st.failed ? `${chapters}. Something went wrong on the server; tap Continue to try again.` : `${chapters}.`;
@@ -516,7 +550,7 @@ el.pauseBtn.addEventListener("click", async () => {
   const id = book.id;
   try {
     await cloud.pause(id);
-    updateEntry(id, { startedAt: 0 }, 0);
+    updateEntry(id, { startedAt: 0, eta: null, audioAt: Date.now() }, 0);
     if (status[id]) status[id].running = false;
     if (book?.id === id) showWork();
   } catch (err) {

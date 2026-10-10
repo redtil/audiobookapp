@@ -20,14 +20,12 @@ import { mkdtempSync, writeFileSync, appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadVoice, trimSilence, encodeMp3, toInt16, SAMPLE_RATE } from "./voice.mjs";
+import { planParts } from "../src/plan.js";
 
 const { LIBRARY_KEY, DATA_REPO, BOOK, VOICE = "af_heart" } = process.env;
 const API = process.env.GITHUB_API || "https://api.github.com";
 const PAUSE = { sentence: 0.28, paragraph: 0.65, chapter: 1.5 };
-// About this many characters per machine. Each machine also spends a minute
-// or two starting up, so very small shares aren't worth it.
-const CHARS_PER_PART = +process.env.CHARS_PER_PART || 20000;
-const MAX_PARTS = 20; // GitHub runs up to 20 jobs at once on the free plan
+const CHARS_PER_PART = +process.env.CHARS_PER_PART || undefined;
 
 async function api(path, { raw = false, ...opts } = {}) {
   const res = await fetch(`${API}${path}`, {
@@ -66,20 +64,6 @@ async function finishedChapters() {
 
 const chapterChars = (c) => c.paras.reduce((n, p) => n + p.reduce((m, s) => m + s.length, 0), 0);
 
-// Split chapters into groups of about equal size: biggest first, each into
-// the lightest group so far.
-export function planParts(chapters, todo) {
-  const total = todo.reduce((n, ch) => n + chapterChars(chapters[ch]), 0);
-  const count = Math.max(1, Math.min(MAX_PARTS, todo.length, Math.ceil(total / CHARS_PER_PART)));
-  const parts = Array.from({ length: count }, () => ({ chars: 0, chapters: [] }));
-  for (const ch of [...todo].sort((a, b) => chapterChars(chapters[b]) - chapterChars(chapters[a]))) {
-    const lightest = parts.reduce((a, b) => (b.chars < a.chars ? b : a));
-    lightest.chapters.push(ch);
-    lightest.chars += chapterChars(chapters[ch]);
-  }
-  return parts.map((p, k) => ({ part: k, chapters: p.chapters.sort((a, b) => a - b).join(",") }));
-}
-
 function output(name, value) {
   if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `${name}=${value}\n`);
   else console.log(`${name}=${value}`);
@@ -89,7 +73,9 @@ async function plan() {
   const book = await readBook();
   const done = await finishedChapters();
   const todo = book.chapters.map((_, ch) => ch).filter((ch) => !done.has(ch));
-  const parts = todo.length ? planParts(book.chapters, todo) : [];
+  const sizes = book.chapters.map(chapterChars);
+  const parts = (todo.length ? planParts(sizes, todo, CHARS_PER_PART) : [])
+    .map((p, k) => ({ part: k, chapters: p.chapters.sort((a, b) => a - b).join(",") }));
   console.log(`${book.chapters.length} chapters, ${done.size} done, ${todo.length} to make on ${parts.length} machines`);
   output("parts", JSON.stringify(parts));
   output("count", parts.length);
@@ -120,6 +106,7 @@ async function makeChapter(speak, chapter, ch) {
     }
     const pause = Math.round(SAMPLE_RATE *
       (i === flat.length - 1 ? PAUSE.chapter : endsParagraph[i] ? PAUSE.paragraph : PAUSE.sentence));
+    if (i && i % 100 === 0) console.log(`chapter ${ch}: ${i} of ${flat.length} sentences`);
     starts.push(+(pos / SAMPLE_RATE).toFixed(3));
     chunks.push(toInt16(samples), new Int16Array(pause));
     pos += samples.length + pause;
