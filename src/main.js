@@ -12,7 +12,15 @@ const els = {
   speedSel: $("speedSel"), voiceSel: $("voiceSel"), status: $("engineStatus"),
 };
 
-const settings = { voice: "kokoro:af_heart", speed: 1, ...store.loadSettings() };
+const DEFAULT_VOICE = "kokoro:af_heart";
+const settings = { voice: DEFAULT_VOICE, speed: 1, ...store.loadSettings() };
+// Earlier builds could save a device voice the user never picked; start
+// everyone on the natural voice once.
+if (settings.v !== 2) {
+  settings.voice = DEFAULT_VOICE;
+  settings.v = 2;
+  store.saveSettings(settings);
+}
 
 const state = {
   id: null,
@@ -50,11 +58,12 @@ function startKokoro() {
       fillVoices();
       if (settings.voice.startsWith("kokoro:")) kokoro.setVoice(settings.voice.slice(7));
     },
+    onStatus: (text) => setStatus(text),
     onError: (msg) => {
       console.error(msg);
       kokoroFailed = true;
       kokoro = null;
-      setStatus("The natural voice couldn't load on this device, so the device voice is used instead.");
+      setStatus(`The natural voice couldn't load on this device (${msg}), so the device voice is used instead.`);
       fillVoices();
     },
   });
@@ -79,16 +88,20 @@ function fillVoices() {
     opts.push(`<optgroup label="Device voices">${group || '<option value="device:">Default</option>'}</optgroup>`);
   }
   els.voiceSel.innerHTML = opts.join("");
-  if (![...els.voiceSel.options].some((o) => o.value === settings.voice)) {
-    settings.voice = els.voiceSel.options[0]?.value || "device:";
-  }
-  els.voiceSel.value = settings.voice;
+  // Show the saved choice when it's available, without overwriting it:
+  // the natural voices only appear once the model has loaded.
+  const has = (v) => [...els.voiceSel.options].some((o) => o.value === v);
+  els.voiceSel.value = has(settings.voice) ? settings.voice : els.voiceSel.options[0]?.value;
 }
 
 if (device) speechSynthesis.onvoiceschanged = fillVoices;
 
 function engine() {
-  if (settings.voice.startsWith("kokoro:") && kokoro?.ready) return kokoro;
+  if (settings.voice.startsWith("kokoro:")) {
+    if (kokoro?.ready) return kokoro;
+    if (kokoroFailed) return device;
+  }
+  if (settings.voice.startsWith("device:")) return device;
   return device;
 }
 
@@ -270,16 +283,19 @@ async function playLoop() {
     }
     setCurrent(state.i, true);
     prefetchAhead();
-    if (eng === kokoro && !els.status.textContent.startsWith("The natural voice couldn't")) setStatus("");
+    if (eng === kokoro && els.status.textContent.startsWith("The natural voice is still")) setStatus("");
     try {
       await eng.speak(s.text, keyFor(state.ch, state.i), isCurrent);
     } catch (err) {
       if (!isCurrent()) return;
       console.warn(err);
-      if (err.name === "NotAllowedError") {
-        setPlaying(false);
-        return;
-      }
+      setPlaying(false);
+      setStatus(
+        err.name === "NotAllowedError"
+          ? "The browser blocked audio. Press play again."
+          : `Couldn't read this sentence aloud (${err.message}).`,
+      );
+      return;
     }
     if (!isCurrent()) return;
     state.i += 1;
@@ -295,6 +311,9 @@ function setPlaying(on) {
 
 function play() {
   if (state.playing) return;
+  // Phones only allow audio that starts from a tap, so unlock it now,
+  // before the first sentence has finished generating.
+  kokoro?.unlock();
   setPlaying(true);
   playLoop();
 }
@@ -424,3 +443,6 @@ function escapeHtml(s) {
 
 setStatus("");
 renderLibrary();
+// Start downloading the voice right away so it's ready by the time a book is open.
+startKokoro();
+fillVoices();

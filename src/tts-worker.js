@@ -2,6 +2,7 @@ import { KokoroTTS } from "kokoro-js";
 
 const MODEL_ID = "onnx-community/Kokoro-82M-v1.0-ONNX";
 let tts = null;
+let device = null;
 
 async function hasWebGPU() {
   try {
@@ -11,25 +12,62 @@ async function hasWebGPU() {
   }
 }
 
-async function load() {
-  const webgpu = await hasWebGPU();
-  const device = webgpu ? "webgpu" : "wasm";
-  const dtype = webgpu ? "fp32" : "q8";
-  tts = await KokoroTTS.from_pretrained(MODEL_ID, {
-    dtype,
-    device,
-    progress_callback: (p) => {
-      if (p.status === "progress" && p.file?.endsWith(".onnx")) {
-        self.postMessage({ type: "progress", loaded: p.loaded, total: p.total });
-      }
-    },
+function progress(p) {
+  if (p.status === "progress" && p.file?.endsWith(".onnx")) {
+    self.postMessage({ type: "progress", loaded: p.loaded, total: p.total });
+  }
+}
+
+async function loadOn(dev) {
+  const model = await KokoroTTS.from_pretrained(MODEL_ID, {
+    dtype: dev === "webgpu" ? "fp32" : "q8",
+    device: dev,
+    progress_callback: progress,
   });
+  // Make sure the model actually runs here before we rely on it.
+  await model.generate("Hi.", { voice: "af_heart" });
+  tts = model;
+  device = dev;
+}
+
+// Graphics-card acceleration is fastest but doesn't work on every device,
+// so fall back to the slower, universal WebAssembly path.
+async function load() {
+  let gpuError = null;
+  if (await hasWebGPU()) {
+    try {
+      await loadOn("webgpu");
+    } catch (err) {
+      gpuError = err;
+      console.warn("WebGPU voice failed, falling back to WebAssembly", err);
+      self.postMessage({ type: "status", text: "Setting up the natural voice in compatibility mode…" });
+    }
+  }
+  if (!tts) {
+    try {
+      await loadOn("wasm");
+    } catch (err) {
+      throw gpuError ? new Error(`${gpuError.message || gpuError}; ${err.message || err}`) : err;
+    }
+  }
   self.postMessage({ type: "ready", device, voices: Object.keys(tts.voices) });
 }
 
 // Generation requests are processed one at a time, in order.
 let queue = Promise.resolve();
 const cancelled = new Set();
+
+async function generate(msg) {
+  try {
+    return await tts.generate(msg.text, { voice: msg.voice, speed: msg.speed });
+  } catch (err) {
+    if (device !== "webgpu") throw err;
+    console.warn("WebGPU generation failed, switching to WebAssembly", err);
+    tts = null;
+    await loadOn("wasm");
+    return tts.generate(msg.text, { voice: msg.voice, speed: msg.speed });
+  }
+}
 
 self.onmessage = (e) => {
   const msg = e.data;
@@ -45,7 +83,7 @@ self.onmessage = (e) => {
     queue = queue.then(async () => {
       if (cancelled.delete(msg.id)) return;
       try {
-        const audio = await tts.generate(msg.text, { voice: msg.voice, speed: msg.speed });
+        const audio = await generate(msg);
         const samples = audio.audio;
         self.postMessage(
           { type: "audio", id: msg.id, samples, rate: audio.sampling_rate },

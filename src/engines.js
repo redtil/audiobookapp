@@ -28,7 +28,7 @@ function toWav(samples, rate) {
 }
 
 export class KokoroEngine {
-  constructor({ onProgress, onReady, onError }) {
+  constructor({ onProgress, onReady, onError, onStatus }) {
     this.worker = new Worker(new URL("./tts-worker.js", import.meta.url), { type: "module" });
     this.pending = new Map();
     this.cache = new Map(); // key -> Promise<blobUrl>
@@ -57,6 +57,15 @@ export class KokoroEngine {
       }
     };
     this.worker.postMessage({ type: "load" });
+  }
+
+  unlock() {
+    if (this.unlocked) return;
+    this.unlocked = true;
+    this.audio.src = URL.createObjectURL(toWav(new Float32Array(2400), 24000));
+    this.audio.play().catch(() => {
+      this.unlocked = false;
+    });
   }
 
   setVoice(voice) {
