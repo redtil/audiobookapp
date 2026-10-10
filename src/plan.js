@@ -1,10 +1,12 @@
 // How a book's chapters are shared between the server's machines. Used by
 // the server to split the work, and by the app to estimate how long it takes.
 
-export const MAX_PARTS = 20; // GitHub runs up to 20 jobs at once on the free plan
-// Measured on GitHub's machines: Kokoro makes speech about 2× faster than
-// real time, and speech is about 15 characters a second.
-const CHARS_PER_SECOND_PER_MACHINE = 25;
+// GitHub's free plan runs about 15 jobs at once (shared by all books being
+// prepared); more parts than that would only wait in line.
+export const MAX_PARTS = 15;
+// Measured on GitHub's machines: Kokoro makes speech 2.1–2.2× faster than
+// real time, and speech is about 14 characters a second.
+const CHARS_PER_SECOND_PER_MACHINE = 28;
 const STARTUP_SECONDS = 120; // queueing, installing, loading the voice
 
 // Split chapters into groups of about equal size: biggest first, each into
@@ -24,9 +26,10 @@ export function planParts(sizes, todo, perPart) {
   return parts;
 }
 
-// Seconds from pressing Prepare until the slowest machine is done.
-export function estimateSeconds(sizes, todo) {
+// Seconds until the slowest machine is done, from pressing Prepare
+// (startup: true) or for work already under way.
+export function estimateSeconds(sizes, todo, { startup = true } = {}) {
   if (!todo.length) return 0;
   const slowest = Math.max(...planParts(sizes, todo).map((p) => p.chars));
-  return STARTUP_SECONDS + slowest / CHARS_PER_SECOND_PER_MACHINE;
+  return (startup ? STARTUP_SECONDS : 0) + slowest / CHARS_PER_SECOND_PER_MACHINE;
 }

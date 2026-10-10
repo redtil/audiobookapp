@@ -136,6 +136,17 @@ function estimateFor(e, index = {}) {
   return { at: Date.now(), seconds: Math.round(estimateSeconds(sizes, todo)) };
 }
 
+// Share of the work done, for the progress bar. Finished chapters alone
+// lag behind (every machine is mid-chapter until near the end), so while
+// it's running this also counts time elapsed against the estimate.
+function progress(e, st) {
+  if (!st) return 0;
+  if (!st.running || !e?.eta) return st.done;
+  const elapsed = (Date.now() - e.eta.at) / 1000;
+  const byTime = Math.min(0.97, elapsed / Math.max(1, elapsed + secondsLeft(e)));
+  return Math.max(st.done, byTime);
+}
+
 function secondsLeft(e) {
   if (!e?.eta) return null;
   return Math.max(0, (e.eta.at + e.eta.seconds * 1000 - Date.now()) / 1000);
@@ -170,6 +181,12 @@ async function refreshStatus(id, runs) {
   };
   if (status[id].running && !e.eta) {
     e.eta = { ...estimateFor(e, index), at: status[id].startedAt || Date.now() };
+    db.saveLibrary(library);
+  } else if (status[id].running && secondsLeft(e) === 0) {
+    // Took longer than expected (another book may have been using the
+    // machines): estimate again from the chapters that are left.
+    const todo = sizes.map((_, ch) => ch).filter((ch) => !index[ch]);
+    e.eta = { at: Date.now(), seconds: Math.round(estimateSeconds(sizes, todo, { startup: false })) + 30 };
     db.saveLibrary(library);
   }
   if (made === e.chapters && e.chapters > 0) await markReady(id, index);
@@ -232,7 +249,7 @@ function renderBooks() {
   el.books.innerHTML = entries.map((e) => {
     const tags = [];
     const st = status[e.id];
-    const pct = st ? Math.floor(st.done * 100) : 0;
+    const pct = st ? Math.floor(progress(e, st) * 100) : 0;
     if (e.ready) {
       tags.push(`<span class="tag ready">Ready · ${formatDuration(e.seconds || 0)}</span>`);
       if (e.finished) tags.push(`<span class="tag done">Finished</span>`);
@@ -518,31 +535,41 @@ function showWork() {
   clearInterval(workTicker);
   workTicker = setInterval(() => {
     if (el.workPanel.hidden || !book) return clearInterval(workTicker);
-    const left = secondsLeft(entry(book.id));
-    if (status[book.id]?.running && left != null) el.workPct.textContent = countdown(left);
+    if (status[book.id]?.running) showProgress();
   }, 1000);
   const e = entry(book.id);
   const st = status[book.id];
-  el.workPct.textContent = st ? `${Math.floor(st.done * 100)}%` : "";
-  el.workBar.style.width = `${(st?.done || 0) * 100}%`;
   const running = !st || st.running;
   el.workTitle.textContent = !st ? "Checking…" : running ? `Preparing${e.voice ? ` with ${voiceLabel(e.voice)}` : ""}` : st.failed ? "Stopped" : "Paused";
-  let info = "";
-  if (st) {
-    const chapters = `${st.made} of ${e.chapters} chapters ready`;
-    if (running) {
-      const left = secondsLeft(e);
-      el.workPct.textContent = left == null ? el.workPct.textContent : countdown(left);
-      info = `${Math.floor(st.done * 100)}% · ${chapters}. Chapters finish in batches, so this jumps ahead in steps. ` +
-        "It keeps going on the server, even if you close the app.";
-    } else {
-      info = st.failed ? `${chapters}. Something went wrong on the server; tap Continue to try again.` : `${chapters}.`;
-    }
-  }
-  el.workInfo.textContent = info;
+  showProgress();
   el.pauseBtn.hidden = !running;
   el.resumeBtn.hidden = running;
   el.restartBtn.hidden = running;
+}
+
+// Percentage, bar, time left and chapters, refreshed every second.
+function showProgress() {
+  const e = entry(book.id);
+  const st = status[book.id];
+  if (!st) {
+    el.workPct.textContent = "";
+    el.workInfo.textContent = "";
+    return;
+  }
+  const done = progress(e, st);
+  const pct = `${Math.floor(done * 100)}%`;
+  const chapters = `${st.made} of ${e.chapters} chapters ready`;
+  el.workBar.style.width = `${done * 100}%`;
+  if (st.running) {
+    const left = secondsLeft(e);
+    el.workPct.textContent = left == null ? pct : countdown(left);
+    el.workInfo.textContent = `${pct} · ${chapters}. It keeps going on the server, even if you close the app.`;
+  } else {
+    el.workPct.textContent = pct;
+    el.workInfo.textContent = st.failed
+      ? `${chapters}. Something went wrong on the server; tap Continue to try again.`
+      : `${chapters}.`;
+  }
 }
 
 el.pauseBtn.addEventListener("click", async () => {
