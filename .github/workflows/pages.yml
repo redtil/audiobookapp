@@ -21,12 +21,15 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      # The voice model (~90 MB) is downloaded once and kept between builds.
+          cache: npm
+      - run: npm ci
+      # A short sample of each voice, made once and kept between builds.
       - uses: actions/cache@v4
         with:
-          path: public/model
-          key: kokoro-model-${{ hashFiles('scripts/fetch-model.mjs', 'src/voices.js') }}
-      - run: npm ci
+          path: public/samples
+          key: voice-samples-${{ hashFiles('server/samples.mjs', 'src/voices.js') }}
+      - run: node server/samples.mjs
+        continue-on-error: true
       - run: npm run build
       - uses: actions/upload-pages-artifact@v3
         with:

@@ -1,0 +1,64 @@
+# Makes a book's audio on GitHub's machines (started from the app).
+# Needs the repository secret LIBRARY_KEY: an access token for the private
+# library repository (Contents: read and write).
+name: Prepare
+run-name: Prepare ${{ inputs.book }}
+on:
+  workflow_dispatch:
+    inputs:
+      book:
+        description: Book id
+        required: true
+      voice:
+        description: Voice
+        default: af_heart
+      library:
+        description: Library repository (owner/name)
+        required: true
+concurrency:
+  group: prepare-${{ inputs.book }}
+  cancel-in-progress: true
+env:
+  LIBRARY_KEY: ${{ secrets.LIBRARY_KEY }}
+  DATA_REPO: ${{ inputs.library }}
+  BOOK: ${{ inputs.book }}
+  VOICE: ${{ inputs.voice }}
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      parts: ${{ steps.plan.outputs.parts }}
+      count: ${{ steps.plan.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --omit=dev --ignore-scripts
+      - id: plan
+        run: node server/prepare.mjs plan
+
+  work:
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.parts) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --omit=dev
+      - uses: actions/cache@v4
+        with:
+          path: node_modules/@huggingface/transformers/.cache
+          key: kokoro-fp32-v1
+      - run: node server/prepare.mjs work
+        env:
+          CHAPTERS: ${{ matrix.chapters }}
+          PART: ${{ github.run_id }}-${{ matrix.part }}

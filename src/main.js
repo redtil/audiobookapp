@@ -1,152 +1,123 @@
 import { readBook, bookIdFor } from "./book.js";
 import * as db from "./db.js";
-import { Voice, prepareBook, sentencesOf, exportBook, importBook, isAudiobookFile } from "./prepare.js";
-import { Player, bookSeconds } from "./player.js";
+import { Library, mergeLibraries, isRemoved } from "./cloud.js";
+import { Player } from "./player.js";
 import { VOICES, voiceLabel } from "./voices.js";
-import { formatTime, formatDuration, buildWav } from "./audio.js";
-import * as sync from "./sync.js";
+import { formatTime, formatDuration } from "./format.js";
 
 const $ = (id) => document.getElementById(id);
 const el = new Proxy({}, { get: (_, id) => $(id) });
 
-// ?mock swaps the model for a test tone, for trying the app without the download.
-const MOCK = new URLSearchParams(location.search).has("mock");
 const CHARS_PER_SECOND = 15; // speaking rate at 1×, for estimates
-
-const settings = { voice: "af_heart", gpu: false, speed: 1, ...db.loadSettings() };
+const settings = { voice: "af_heart", speed: 1, ...db.loadSettings() };
 const save = () => db.saveSettings(settings);
-const me = sync.deviceInfo(settings);
-save();
 
-let library = db.loadLibrary(); // { books: { id: entry } }, see sync.js
-let book = null; // the open book's full record
-let shownCh = -1; // chapter shown in the text view
-let spans = []; // sentence elements of the shown chapter
-let voice = null; // Voice (model worker), loaded on demand
-let voiceGpu = null;
-let job = null; // { controller, bookId } of the preparation in progress
-let wakeLock = null;
+let cloud = null; // Library, once connected
+let library = db.loadLibrary(); // { books: { id: entry } }
+const status = {}; // id -> { index, made, done (0..1), running, failed, startedAt }
+let book = null; // the open book (full text)
+let shownCh = -1;
+let spans = [];
 
-const player = new Player(el.audio, {
-  onChapter: (ch) => showChapter(ch),
-  onSentence: (ch, i) => {
-    if (!book) return;
-    markSentence(i);
-    updateEntry(book.id, { pos: { ch, i, at: Date.now() } }, { quiet: true });
-  },
-  onState: (playing) => {
-    el.playBtn.textContent = playing ? "❚❚" : "▶";
-    el.playBtn.setAttribute("aria-label", playing ? "Pause" : "Play");
-    if ("mediaSession" in navigator) navigator.mediaSession.playbackState = playing ? "playing" : "paused";
-    if (!book) return;
-    if (playing && entry(book.id)?.finished) updateEntry(book.id, { finished: false, finishedAt: Date.now() });
-    if (!playing) syncSoon(2000); // save the position where you paused
-  },
-  onFinished: () => {
-    if (book) updateEntry(book.id, { finished: true, finishedAt: Date.now(), pos: { ch: 0, i: 0, at: Date.now() } });
-  },
-  onTime: (now, total) => {
-    if (!seeking) el.seekBar.value = total ? Math.round((now / total) * 1000) : 0;
-    el.timeNow.textContent = formatTime(now);
-    el.timeLeft.textContent = `-${formatTime(total - now)}`;
-    updatePosition(now, total);
-  },
+// ---------- connecting ----------
+
+// Repositories default to the ones this site is published from:
+// <owner>.github.io/<repo>/ -> app <owner>/<repo>, library <owner>/audiobook-data.
+function defaults() {
+  const owner = location.hostname.match(/^([\w-]+)\.github\.io$/)?.[1];
+  const repo = location.pathname.split("/").filter(Boolean)[0];
+  return owner && repo ? { appRepo: `${owner}/${repo}`, dataRepo: `${owner}/audiobook-data` } : { appRepo: "", dataRepo: "" };
+}
+
+// A link from "Add another device" carries the key in the #fragment, which
+// never leaves the browser.
+function takeKeyFromLink() {
+  const hash = new URLSearchParams(location.hash.slice(1));
+  if (!hash.get("key")) return;
+  settings.conn = {
+    ...defaults(),
+    key: hash.get("key"),
+    ...(hash.get("lib") ? { dataRepo: hash.get("lib") } : {}),
+    ...(hash.get("app") ? { appRepo: hash.get("app") } : {}),
+  };
+  save();
+  history.replaceState(null, "", location.pathname + location.search);
+}
+
+function showConnect(error) {
+  el.connect.hidden = false;
+  el.library.hidden = true;
+  el.bookScreen.hidden = true;
+  const d = { ...defaults(), ...settings.conn };
+  el.dataRepoInput.value ||= d.dataRepo;
+  el.appRepoInput.value ||= d.appRepo;
+  el.appRepoName.textContent = d.appRepo ? d.appRepo.split("/")[1] : "this app's repository";
+  el.connectError.textContent = error || "";
+  el.connectError.hidden = !error;
+}
+
+el.connectBtn.addEventListener("click", async () => {
+  const conn = {
+    key: el.keyInput.value.trim(),
+    dataRepo: el.dataRepoInput.value.trim(),
+    appRepo: el.appRepoInput.value.trim(),
+  };
+  if (!conn.key) return showConnect("Paste your library key.");
+  if (!/^[\w.-]+\/[\w.-]+$/.test(conn.dataRepo) || !/^[\w.-]+\/[\w.-]+$/.test(conn.appRepo)) {
+    el.connect.querySelector(".advanced").open = true;
+    return showConnect("Fill in the library and app under Advanced (as owner/name).");
+  }
+  el.connectBtn.disabled = true;
+  try {
+    const lib = new Library(conn);
+    await lib.check();
+    cloud = lib;
+    settings.conn = conn;
+    save();
+    await showLibrary();
+  } catch (err) {
+    showConnect(err.message);
+  } finally {
+    el.connectBtn.disabled = false;
+  }
 });
 
 // ---------- library state ----------
 
 const entry = (id) => library.books[id];
 
-function updateEntry(id, changes, { quiet = false } = {}) {
+function updateEntry(id, changes, delay = 2000) {
   const e = library.books[id];
   if (!e) return;
   Object.assign(e, changes);
   db.saveLibrary(library);
-  syncSoon(quiet ? 30_000 : 3000);
+  syncSoon(delay);
 }
-
-// Record how far this device has got with a book's audio.
-function updateDevice(id, info) {
-  const e = library.books[id];
-  if (!e) return;
-  e.devices = { ...e.devices, [me.id]: { name: settings.deviceName, ...e.devices?.[me.id], ...info, at: Date.now() } };
-  db.saveLibrary(library);
-  syncSoon(5000);
-}
-
-function entryFor(rec) {
-  return {
-    id: rec.id,
-    title: rec.title,
-    chapters: rec.chapters.length,
-    total: rec.total,
-    chars: rec.chars,
-    addedAt: rec.addedAt || Date.now(),
-    devices: {},
-  };
-}
-
-// Every book on this device should be in the library (older versions and
-// imports from files may not have added it yet).
-async function adoptLocalBooks() {
-  for (const rec of await db.listBooks().catch(() => [])) {
-    const e = library.books[rec.id];
-    if (e && !sync.isRemoved(e)) continue;
-    if (e && sync.isRemoved(e)) {
-      // Removed on another device: remove it here too.
-      await db.deleteBook(rec.id);
-      continue;
-    }
-    library.books[rec.id] = entryFor(rec);
-    const made = rec.ready ? rec.total : await db.countClips(rec.id);
-    if (made) library.books[rec.id].devices[me.id] = { name: settings.deviceName, voice: rec.voice, done: made, ready: !!rec.ready, at: Date.now() };
-  }
-  db.saveLibrary(library);
-}
-
-// ---------- sync ----------
 
 let syncTimer = null;
 let syncing = null;
 
 function syncSoon(ms) {
-  if (!sync.syncConfig(settings)) return;
   clearTimeout(syncTimer);
   syncTimer = setTimeout(syncNow, ms);
 }
 
 async function syncNow() {
-  const cfg = sync.syncConfig(settings);
-  if (!cfg) return;
+  if (!cloud) return;
   clearTimeout(syncTimer);
   if (syncing) return syncing;
   syncing = (async () => {
-    el.syncState.textContent = "Syncing…";
     try {
-      for (const rec of await db.listBooks()) {
-        if (!rec.uploaded) {
-          await sync.uploadBookText(cfg, rec);
-          rec.uploaded = true;
-          await db.putBook(rec);
-        }
-      }
-      const merged = await sync.syncLibrary(cfg, library);
-      // Keep any change made while we were talking to GitHub.
-      library = sync.mergeLibraries(merged, library);
+      const merged = await cloud.syncLibrary(library);
+      library = mergeLibraries(merged, library); // keep changes made meanwhile
       db.saveLibrary(library);
-      settings.lastSync = Date.now();
-      save();
-      showSyncState();
-      if (!el.library.hidden) {
-        await adoptLocalBooks(); // applies removals made elsewhere
-        renderBooks();
-      }
+      el.syncState.textContent = "";
       return true;
     } catch (err) {
       console.warn("Sync failed", err);
-      el.syncState.textContent = navigator.onLine === false ? "Offline: will sync later" : "Sync failed";
+      el.syncState.textContent = navigator.onLine === false ? "Offline" : "Couldn't reach the library";
       el.syncState.title = err.message;
-      return err;
+      return false;
     } finally {
       syncing = null;
     }
@@ -154,74 +125,108 @@ async function syncNow() {
   return syncing;
 }
 
-function showSyncState() {
-  const on = !!sync.syncConfig(settings);
-  el.syncState.title = "";
-  el.syncState.textContent = !on ? "" : settings.lastSync ? `Synced ${ago(settings.lastSync)}` : "";
+const chapterSizes = (b) => b.chapters.map((c) => c.paras.reduce((n, p) => n + p.reduce((m, s) => m + s.length, 0), 0));
+
+// How far along a book's audio is, from the chapters on the server and any
+// preparation running now.
+async function refreshStatus(id, runs) {
+  const e = entry(id);
+  if (!e || e.ready) return status[id];
+  const [index, active] = await Promise.all([cloud.audioIndex(id), runs ? null : cloud.activeRuns(id)]);
+  const run = runs ? runs[id] : active[0];
+  const sizes = e.sizes || [];
+  const total = sizes.reduce((a, b) => a + b, 0) || 1;
+  const made = Object.keys(index).length;
+  const madeChars = Object.keys(index).reduce((n, ch) => n + (sizes[ch] || 0), 0);
+  const running = !!run && run.status !== "completed";
+  // A run takes a few seconds to show up after it's started.
+  const starting = !running && e.startedAt && Date.now() - e.startedAt < 90_000 && made < e.chapters;
+  status[id] = {
+    index,
+    made,
+    done: madeChars / total,
+    running: running || starting,
+    failed: !running && !starting && run?.conclusion === "failure",
+    startedAt: run?.run_started_at ? Date.parse(run.run_started_at) : e.startedAt,
+  };
+  if (made === e.chapters && e.chapters > 0) await markReady(id, index);
+  return status[id];
 }
 
-function ago(t) {
-  const s = (Date.now() - t) / 1000;
-  if (s < 60) return "just now";
-  if (s < 3600) return `${Math.round(s / 60)} min ago`;
-  if (s < 86400) return `${Math.round(s / 3600)} h ago`;
-  return new Date(t).toLocaleDateString();
+async function markReady(id, index) {
+  // Total length, from each chapter's timings (small files).
+  const durations = await Promise.all(Object.values(index).map(async (ids) => {
+    try {
+      return JSON.parse(await (await cloud.blob(ids.json)).text()).duration;
+    } catch {
+      return 0;
+    }
+  }));
+  updateEntry(id, { ready: true, seconds: durations.reduce((a, b) => a + b, 0), startedAt: 0, audioAt: Date.now() }, 500);
+  const rec = await db.getBook(id);
+  if (rec) await db.putBook({ ...rec, index });
+  if (book?.id === id) book.index = index;
 }
 
 // ---------- library screen ----------
 
+let libraryTimer = null;
+
 async function showLibrary() {
-  stopPreparing();
   player.close();
   book = null;
+  clearInterval(bookTimer);
   document.title = "Kokoro Reader";
+  el.connect.hidden = true;
   el.bookScreen.hidden = true;
   el.library.hidden = false;
-  await renderBooks();
-  syncNow();
+  el.settings.hidden = true;
+  renderBooks();
+  await syncNow();
+  renderBooks();
+  await refreshAll();
+  clearInterval(libraryTimer);
+  libraryTimer = setInterval(() => !el.library.hidden && document.visibilityState === "visible" && refreshAll(), 30_000);
 }
 
-async function renderBooks() {
-  const local = new Map((await db.listBooks().catch(() => [])).map((b) => [b.id, b]));
-  const entries = Object.values(library.books)
-    .filter((e) => !sync.isRemoved(e))
-    .sort((a, b) => (b.pos?.at || b.addedAt) - (a.pos?.at || a.addedAt));
+async function refreshAll() {
+  // Every unfinished book, including ones another device started moments ago.
+  const pending = Object.values(library.books).filter((e) => !isRemoved(e) && !e.ready);
+  if (!pending.length) return;
+  try {
+    const runs = await cloud.latestRuns();
+    await Promise.all(pending.map((e) => refreshStatus(e.id, runs)));
+  } catch (err) {
+    console.warn(err);
+  }
+  if (!el.library.hidden) renderBooks();
+}
 
-  const rows = await Promise.all(entries.map(async (e) => {
-    const rec = local.get(e.id);
+function renderBooks() {
+  const entries = Object.values(library.books)
+    .filter((e) => !isRemoved(e))
+    .sort((a, b) => (b.pos?.at || b.addedAt) - (a.pos?.at || a.addedAt));
+  el.books.innerHTML = entries.map((e) => {
     const tags = [];
-    // Listening
-    if (e.finished) tags.push(`<span class="tag done">Finished</span>`);
-    else if (e.pos && (e.pos.ch || e.pos.i)) tags.push(`<span class="tag">Paused · chapter ${e.pos.ch + 1} of ${e.chapters}</span>`);
-    else tags.push(`<span class="tag">Not started</span>`);
-    // Audio on this device
-    if (rec?.ready) tags.push(`<span class="tag ready">Audio ready · ${formatDuration(rec.seconds || 0)}</span>`);
-    else if (rec) {
-      const made = await db.countClips(rec.id);
-      const pct = Math.floor((made / rec.total) * 100);
-      if (job?.bookId === rec.id) tags.push(`<span class="tag">Preparing ${pct}%</span>`);
-      else if (made) tags.push(`<span class="tag">Preparing paused · ${pct}%</span>`);
-      else tags.push(`<span class="tag">No audio yet</span>`);
-    } else tags.push(`<span class="tag away">Not on this device yet</span>`);
-    // Other devices
-    for (const [id, d] of Object.entries(e.devices || {})) {
-      if (id === me.id) continue;
-      const state = d.ready ? "audio ready" : `${Math.floor((d.done / e.total) * 100)}% prepared`;
-      tags.push(`<span class="tag away">${esc(d.name || "Other device")}: ${state}</span>`);
-    }
+    const st = status[e.id];
+    const pct = st ? Math.floor(st.done * 100) : 0;
+    if (e.ready) {
+      tags.push(`<span class="tag ready">Ready · ${formatDuration(e.seconds || 0)}</span>`);
+      if (e.finished) tags.push(`<span class="tag done">Finished</span>`);
+      else if (e.pos && (e.pos.ch || e.pos.i)) tags.push(`<span class="tag">Paused at chapter ${e.pos.ch + 1} of ${e.chapters}</span>`);
+      else tags.push(`<span class="tag">Not started</span>`);
+    } else if (!st && !e.voice) tags.push(`<span class="tag">Not prepared yet</span>`);
+    else if (!st) tags.push(`<span class="tag">Checking…</span>`);
+    else if (!st.running && !st.made && !e.voice) tags.push(`<span class="tag">Not prepared yet</span>`);
+    else if (st.running) tags.push(`<span class="tag busy">Preparing · ${pct}%</span>`);
+    else if (st.failed) tags.push(`<span class="tag">Stopped at ${pct}% · open to continue</span>`);
+    else tags.push(`<span class="tag">Paused · ${pct}%</span>`);
     return `<li>
       <button class="open" data-open="${esc(e.id)}"><strong>${esc(e.title)}</strong><span class="tags">${tags.join("")}</span></button>
       <button class="icon-btn remove" data-remove="${esc(e.id)}" aria-label="Remove ${esc(e.title)}">✕</button>
     </li>`;
-  }));
-  el.books.innerHTML = rows.join("");
+  }).join("");
   el.noBooks.hidden = entries.length > 0;
-  try {
-    const { usage, quota } = await navigator.storage.estimate();
-    el.storage.textContent = local.size
-      ? `Using ${(usage / 1e6).toFixed(0)} MB of storage on this device (${(quota / 1e9).toFixed(1)} GB available).`
-      : "";
-  } catch {}
 }
 
 async function addFile(file) {
@@ -229,37 +234,26 @@ async function addFile(file) {
   el.drop.classList.add("busy");
   const label = el.drop.querySelector(".drop-title");
   try {
-    if (await isAudiobookFile(file)) {
-      label.textContent = "Opening audiobook…";
-      const rec = await importBook(file, (f) => (label.textContent = `Opening audiobook… ${Math.round(f * 100)}%`));
-      const e = library.books[rec.id];
-      if (!e || sync.isRemoved(e)) library.books[rec.id] = entryFor(rec);
-      updateDevice(rec.id, { voice: rec.voice, done: rec.total, ready: true });
-      await openBook(rec.id);
-      return;
-    }
     label.textContent = "Reading the book…";
     const id = await bookIdFor(file);
-    let rec = await db.getBook(id);
-    if (!rec) {
+    const known = entry(id);
+    if (!known || isRemoved(known)) {
       const parsed = await readBook(file);
-      rec = {
-        id,
-        title: parsed.title,
-        chapters: parsed.chapters,
-        total: sentencesOf(parsed).length,
-        chars: parsed.chapters.reduce((n, c) => n + c.paras.flat().join("").length, 0),
-        addedAt: Date.now(),
-      };
+      const rec = { id, title: parsed.title, chapters: parsed.chapters };
+      label.textContent = "Adding it to your library…";
+      await cloud.uploadBook(rec);
       await db.putBook(rec);
-    }
-    const e = library.books[id];
-    if (!e || sync.isRemoved(e)) {
-      library.books[id] = { ...entryFor(rec), ...(e ? { pos: e.pos, devices: e.devices } : {}), addedAt: Date.now() };
+      library.books[id] = {
+        id,
+        title: rec.title,
+        chapters: rec.chapters.length,
+        sizes: chapterSizes(rec),
+        addedAt: Date.now(),
+        audioAt: Date.now(),
+      };
       db.saveLibrary(library);
-      syncSoon(1000);
+      await syncNow();
     }
-    db.persist();
     await openBook(id);
   } catch (err) {
     console.error(err);
@@ -271,66 +265,98 @@ async function addFile(file) {
 }
 
 function showLibError(err) {
-  el.libError.textContent = /quota|space/i.test(err.message)
-    ? "This device is out of storage space for the browser. Remove a book and try again."
-    : err.message || "Couldn't open that file.";
+  el.libError.textContent = err.message || "Something went wrong.";
   el.libError.hidden = false;
 }
 
 async function removeBook(id) {
   const e = entry(id);
-  const where = sync.syncConfig(settings) ? " from all your devices" : "";
-  if (!confirm(`Remove "${e?.title}"${where}? Its audio on this device is deleted too.`)) return;
+  if (!e || !confirm(`Remove "${e.title}" and its audio from your library?`)) return;
+  try {
+    await cloud.pause(id);
+    await cloud.deleteBook(id);
+  } catch (err) {
+    return showLibError(err);
+  }
   await db.deleteBook(id);
-  if (e) updateEntry(id, { deletedAt: Date.now() });
+  updateEntry(id, { deletedAt: Date.now() }, 0);
   renderBooks();
-  syncNow();
 }
 
 // ---------- book screen ----------
 
+let bookTimer = null;
+
 async function openBook(id) {
   el.libError.hidden = true;
+  const e = entry(id);
+  if (!e) return;
   let rec = await db.getBook(id);
   if (!rec) {
-    // Only in the synced library: fetch its text from GitHub.
-    const cfg = sync.syncConfig(settings);
-    if (!cfg) return;
     try {
-      el.syncState.textContent = "Getting the book…";
-      rec = { ...(await sync.downloadBookText(cfg, id)), addedAt: entry(id)?.addedAt || Date.now(), uploaded: true };
+      el.syncState.textContent = "Opening…";
+      rec = await cloud.downloadBook(id);
       await db.putBook(rec);
-      db.persist();
-      showSyncState();
+      el.syncState.textContent = "";
     } catch (err) {
-      showSyncState();
-      return showLibError(new Error(`Couldn't get this book from GitHub (${err.message}).`));
+      el.syncState.textContent = "";
+      return showLibError(new Error(`Couldn't open this book (${err.message}).`));
     }
   }
   book = rec;
-  book.openedAt = Date.now();
-  db.putBook(book);
-
   document.title = book.title;
   el.bookTitle.textContent = book.title;
   el.library.hidden = true;
   el.bookScreen.hidden = false;
-  el.tocList.innerHTML = book.chapters
-    .map((c, i) => `<li><button data-ch="${i}">${esc(c.title)}</button></li>`)
-    .join("");
-
-  const pos = entry(id)?.pos || { ch: 0, i: 0 };
-  const ch = Math.min(pos.ch, book.chapters.length - 1);
+  el.tocList.innerHTML = book.chapters.map((c, i) => `<li><button data-ch="${i}">${esc(c.title)}</button></li>`).join("");
   shownCh = -1;
-  if (book.ready) {
-    showPanel("player");
-    await player.open(book, ch, pos.i);
+  const pos = e.pos || { ch: 0, i: 0 };
+  showChapter(Math.min(pos.ch, book.chapters.length - 1));
+  await showBookState();
+}
+
+// Pick the panel for where this book is: choose a voice, preparing, or ready.
+async function showBookState() {
+  clearInterval(bookTimer);
+  const e = entry(book.id);
+  if (e.ready) return openPlayer();
+  if (!e.voice) {
+    const st = await refreshStatus(book.id).catch(() => null);
+    if (!st?.running && !st?.made) return showSetup();
+  }
+  showWork();
+  const myBook = book;
+  const poll = async () => {
+    try {
+      await refreshStatus(myBook.id);
+    } catch (err) {
+      if (book === myBook) el.workInfo.textContent = err.message;
+      return;
+    }
+    if (book !== myBook) return;
+    if (entry(myBook.id).ready) return showBookState();
+    showWork();
+  };
+  await poll();
+  if (book === myBook && !entry(myBook.id).ready) {
+    bookTimer = setInterval(() => document.visibilityState === "visible" && poll(), 15_000);
+  }
+}
+
+async function openPlayer() {
+  clearInterval(bookTimer);
+  showPanel("player");
+  const e = entry(book.id);
+  try {
+    if (!book.index) {
+      book.index = await cloud.audioIndex(book.id);
+      db.putBook(book);
+    }
+    const pos = e.pos || { ch: 0, i: 0 };
+    await player.open(book, book.index, (sha) => cloud.blob(sha), Math.min(pos.ch, book.chapters.length - 1), pos.i);
     updateMetadata();
-  } else {
-    showChapter(ch);
-    const made = await db.countClips(book.id);
-    if (made) showWork(made, null, false);
-    else showSetup();
+  } catch (err) {
+    playerStatus(`Couldn't load the audio (${err.message}).`);
   }
 }
 
@@ -392,25 +418,20 @@ function markSentence(i) {
 }
 
 function goToChapter(ch) {
-  if (book.ready) player.goToSentence(ch, 0);
+  if (player.track) player.goToSentence(ch, 0);
   else showChapter(ch);
 }
 
-// ---------- step 1: set up ----------
+// ---------- choose a voice ----------
 
 function showSetup() {
   showPanel("setup");
-  const listen = book.chars / CHARS_PER_SECOND;
+  const chars = chapterSizes(book).reduce((a, b) => a + b, 0);
   el.setupInfo.textContent =
-    `${book.chapters.length} chapters · about ${formatDuration(listen)} of listening. ` +
-    `The whole book is turned into audio first, then it plays like an audiobook.`;
-  const elsewhere = Object.entries(entry(book.id)?.devices || {}).find(([id, d]) => id !== me.id && d.ready);
-  if (elsewhere) {
-    el.setupInfo.textContent += ` It's already prepared on ${elsewhere[1].name}: there, use “Save audiobook file” and open that file here to skip this step.`;
-  }
-  el.voiceSel.innerHTML = VOICES.map((v) => `<option value="${v.id}">${voiceLabel(v.id)}${v.note ? ` · ${v.note}` : ""}</option>`).join("");
+    `${book.chapters.length} chapters · about ${formatDuration(chars / CHARS_PER_SECOND)} of listening. ` +
+    "The whole book is prepared on the server; you can close the app while it works.";
+  el.voiceSel.innerHTML = VOICES.map((v) => `<option value="${v.id}">${voiceLabel(v.id)}</option>`).join("");
   el.voiceSel.value = settings.voice;
-  el.engineSel.value = settings.gpu ? "gpu" : "cpu";
   setupStatus("");
 }
 
@@ -420,178 +441,148 @@ function setupStatus(text, isError = false) {
   el.setupStatus.classList.toggle("error", isError);
 }
 
-// Load the model once, on the engine chosen. Reports download progress to `say`.
-async function getVoice(say) {
-  if (voice && voiceGpu === settings.gpu) return voice;
-  voice?.destroy();
-  voiceGpu = settings.gpu;
-  say("Loading the voice…");
-  voice = new Voice({
-    gpu: settings.gpu,
-    mock: MOCK,
-    onProgress: (loaded, total) => total && say(`Loading the voice… ${Math.round((loaded / total) * 100)}%`),
-    onNote: say,
-  });
+const sample = new Audio();
+el.sampleBtn.addEventListener("click", () => {
+  if (!sample.paused) return sample.pause();
+  sample.src = `./samples/${el.voiceSel.value}.mp3`;
+  sample.play().catch(() => setupStatus("The voice sample isn't available.", true));
+});
+sample.addEventListener("play", () => (el.sampleBtn.textContent = "❚❚ Stop"));
+sample.addEventListener("pause", () => (el.sampleBtn.textContent = "▶ Hear it"));
+el.voiceSel.addEventListener("change", () => {
+  settings.voice = el.voiceSel.value;
+  save();
+  if (!sample.paused) {
+    sample.src = `./samples/${el.voiceSel.value}.mp3`;
+    sample.play().catch(() => {});
+  }
+});
+
+async function startPreparing(voice) {
+  const id = book.id;
   try {
-    await voice.ready;
+    await cloud.startPreparing(id, voice);
   } catch (err) {
-    voice.destroy();
-    voice = null;
-    throw new Error(`The voice couldn't start on this device (${err.message}).`);
-  }
-  return voice;
-}
-
-let sampleAudio = null;
-async function playSample() {
-  el.sampleBtn.disabled = true;
-  try {
-    const v = await getVoice((t) => setupStatus(t));
-    setupStatus("Making a sample…");
-    const first = book.chapters[0].paras.flat().find((s) => s.length > 40) || "This is how your book will sound.";
-    const { data } = await v.speak(first.slice(0, 200), el.voiceSel.value);
-    if (sampleAudio) URL.revokeObjectURL(sampleAudio.src);
-    sampleAudio = new Audio(URL.createObjectURL(buildWav([{ data, pauseAfter: 0 }]).blob));
-    await sampleAudio.play();
-    setupStatus("");
-  } catch (err) {
-    if (err.message !== "cancelled") setupStatus(err.message, true);
-  } finally {
-    el.sampleBtn.disabled = false;
-  }
-}
-
-// ---------- step 2: prepare ----------
-
-async function startPreparing() {
-  if (job) return;
-  if (!book.voice) {
-    book.voice = settings.voice;
-    await db.putBook(book);
-  }
-  const myBook = book;
-  const controller = new AbortController();
-  job = { controller, bookId: myBook.id };
-  const { signal } = controller;
-  showWork(0, null, true);
-  el.workInfo.textContent = "Loading the voice…";
-  keepAwake(true);
-  let lastReport = 0;
-  try {
-    const v = await getVoice((t) => (el.workInfo.textContent = t));
-    if (signal.aborted) return;
-    const result = await prepareBook(myBook, v, {
-      signal,
-      onProgress: ({ done, total, secondsLeft }) => {
-        if (book === myBook && !signal.aborted) showWork(done, secondsLeft, true);
-        if (Date.now() - lastReport > 60_000) {
-          lastReport = Date.now();
-          updateDevice(myBook.id, { voice: myBook.voice, done, ready: false });
-        }
-      },
-    });
-    if (!result.complete) {
-      updateDevice(myBook.id, { voice: myBook.voice, done: await db.countClips(myBook.id), ready: false });
-      return;
+    if (book?.id === id) {
+      if (el.setupPanel.hidden) el.workInfo.textContent = err.message;
+      else setupStatus(err.message, true);
     }
-    myBook.ready = true;
-    myBook.seconds = await bookSeconds(myBook);
-    await db.putBook(myBook);
-    updateDevice(myBook.id, { voice: myBook.voice, done: myBook.total, ready: true });
-    if (book === myBook) {
-      const pos = entry(myBook.id)?.pos || { ch: 0, i: 0 };
-      shownCh = -1;
-      showPanel("player");
-      await player.open(myBook, pos.ch, pos.i);
-      notify(myBook.title);
-    }
-  } catch (err) {
-    console.error(err);
-    if (book === myBook) {
-      el.workTitle.textContent = "Stopped";
-      el.workInfo.textContent = err.message;
-      setWorkButtons(false);
-    }
-  } finally {
-    if (job?.controller === controller) job = null;
-    keepAwake(false);
+    return;
   }
+  updateEntry(id, { voice, startedAt: Date.now(), ready: false, audioAt: Date.now() }, 0);
+  status[id] = { index: {}, made: 0, done: 0, ...status[id], running: true, failed: false, startedAt: Date.now() };
+  await syncNow(); // so other devices see it straight away, even if this one closes
+  if (book?.id === id) showBookState();
 }
 
-function stopPreparing() {
-  if (!job) return;
-  job.controller.abort();
-  job = null;
-  voice?.clear();
-  keepAwake(false);
-}
+el.prepareBtn.addEventListener("click", async () => {
+  sample.pause();
+  el.prepareBtn.disabled = true;
+  setupStatus("Starting…");
+  await startPreparing(el.voiceSel.value);
+  el.prepareBtn.disabled = false;
+});
 
-function showWork(done, secondsLeft, running) {
+// ---------- preparing ----------
+
+function showWork() {
   showPanel("work");
-  const pct = book.total ? Math.floor((done / book.total) * 100) : 0;
-  el.workPct.textContent = `${pct}%`;
-  el.workBar.style.width = `${(done / book.total) * 100}%`;
-  el.workTitle.textContent = running ? `Preparing with ${voiceLabel(book.voice)}` : "Paused";
-  const counts = `${done.toLocaleString()} of ${book.total.toLocaleString()} sentences`;
-  el.workInfo.textContent = running
-    ? `${counts}${secondsLeft != null ? ` · ${formatDuration(secondsLeft)} left` : " · working out the time left…"}`
-    : `${counts} done with ${voiceLabel(book.voice)}.`;
-  setWorkButtons(running);
-}
-
-function setWorkButtons(running) {
-  el.stopBtn.hidden = !running;
+  const e = entry(book.id);
+  const st = status[book.id];
+  el.workPct.textContent = st ? `${Math.floor(st.done * 100)}%` : "";
+  el.workBar.style.width = `${(st?.done || 0) * 100}%`;
+  const running = !st || st.running;
+  el.workTitle.textContent = !st ? "Checking…" : running ? `Preparing${e.voice ? ` with ${voiceLabel(e.voice)}` : ""}` : st.failed ? "Stopped" : "Paused";
+  let info = "";
+  if (st) {
+    const chapters = `${st.made} of ${e.chapters} chapters ready`;
+    if (running) {
+      const elapsed = (Date.now() - (st.startedAt || Date.now())) / 1000;
+      const left = st.done > 0.05 ? (elapsed * (1 - st.done)) / st.done : null;
+      info = `${chapters}${left ? ` · about ${formatDuration(left)} left` : st.made ? "" : " · starting up"}. ` +
+        "It keeps going on the server, even if you close the app.";
+    } else {
+      info = st.failed ? `${chapters}. Something went wrong on the server; tap Continue to try again.` : `${chapters}.`;
+    }
+  }
+  el.workInfo.textContent = info;
+  el.pauseBtn.hidden = !running;
   el.resumeBtn.hidden = running;
   el.restartBtn.hidden = running;
 }
 
-async function startOver() {
-  if (!confirm("Delete the audio made on this device and choose a voice again?")) return;
-  stopPreparing();
-  player.close();
-  await db.deleteClips(book.id);
-  book.voice = null;
-  book.ready = false;
-  book.seconds = 0;
-  await db.putBook(book);
-  updateDevice(book.id, { voice: null, done: 0, ready: false });
-  const ch = shownCh;
-  shownCh = -1;
-  showChapter(Math.max(0, ch));
-  showSetup();
-}
-
-async function keepAwake(on) {
+el.pauseBtn.addEventListener("click", async () => {
+  el.pauseBtn.disabled = true;
+  const id = book.id;
   try {
-    if (on && !wakeLock && "wakeLock" in navigator) {
-      wakeLock = await navigator.wakeLock.request("screen");
-      wakeLock.addEventListener("release", () => (wakeLock = null));
-    } else if (!on && wakeLock) {
-      await wakeLock.release();
-      wakeLock = null;
-    }
-  } catch {}
-}
-
-document.addEventListener("visibilitychange", () => {
-  // The screen lock is dropped whenever the page is hidden; take it back.
-  if (document.visibilityState === "visible" && job) keepAwake(true);
-  if (document.visibilityState === "visible") syncSoon(500);
-  else syncNow(); // leaving: save where you are
+    await cloud.pause(id);
+    updateEntry(id, { startedAt: 0 }, 0);
+    if (status[id]) status[id].running = false;
+    if (book?.id === id) showWork();
+  } catch (err) {
+    el.workInfo.textContent = err.message;
+  } finally {
+    el.pauseBtn.disabled = false;
+  }
 });
 
-function notify(title) {
-  document.title = `✓ ${title}`;
-  setTimeout(() => book && (document.title = book.title), 8000);
-  try {
-    navigator.vibrate?.(200);
-  } catch {}
-}
+el.resumeBtn.addEventListener("click", () => startPreparing(entry(book.id).voice || settings.voice));
 
-// ---------- step 3: listen ----------
+async function startOver() {
+  if (!confirm("Delete this book's audio and choose a voice again?")) return;
+  const id = book.id;
+  try {
+    await cloud.pause(id);
+    await cloud.deleteAudio(id);
+  } catch (err) {
+    return alert(err.message);
+  }
+  player.close();
+  delete status[id];
+  delete book.index;
+  db.putBook(book);
+  updateEntry(id, { voice: null, ready: false, seconds: 0, startedAt: 0, audioAt: Date.now() }, 0);
+  showBookState();
+}
+el.restartBtn.addEventListener("click", startOver);
+el.redoBtn.addEventListener("click", startOver);
+
+// ---------- listening ----------
 
 let seeking = false;
 let lastPositionUpdate = 0;
+
+const player = new Player(el.audio, {
+  onChapter: (ch) => showChapter(ch),
+  onSentence: (ch, i) => {
+    if (!book) return;
+    markSentence(i);
+    updateEntry(book.id, { pos: { ch, i, at: Date.now() } }, 60_000);
+  },
+  onState: (playing) => {
+    el.playBtn.textContent = playing ? "❚❚" : "▶";
+    el.playBtn.setAttribute("aria-label", playing ? "Pause" : "Play");
+    if ("mediaSession" in navigator) navigator.mediaSession.playbackState = playing ? "playing" : "paused";
+    if (!book) return;
+    if (playing && entry(book.id)?.finished) updateEntry(book.id, { finished: false, finishedAt: Date.now() });
+    if (!playing) syncSoon(1500); // save where you paused
+  },
+  onFinished: () => {
+    if (book) updateEntry(book.id, { finished: true, finishedAt: Date.now(), pos: { ch: 0, i: 0, at: Date.now() } }, 500);
+  },
+  onLoading: (on) => playerStatus(on ? "Loading the chapter…" : ""),
+  onTime: (now, total) => {
+    if (!seeking) el.seekBar.value = total ? Math.round((now / total) * 1000) : 0;
+    el.timeNow.textContent = formatTime(now);
+    el.timeLeft.textContent = `-${formatTime(total - now)}`;
+    updatePosition(now, total);
+  },
+});
+
+function playerStatus(text) {
+  el.playerStatus.textContent = text;
+  el.playerStatus.hidden = !text;
+}
 
 function updateMetadata() {
   if (!("mediaSession" in navigator) || !book) return;
@@ -622,33 +613,41 @@ if ("mediaSession" in navigator) {
   };
   for (const [action, fn] of Object.entries(handlers)) {
     try {
-      navigator.mediaSession.setActionHandler(action, (e) => book?.ready && fn(e));
+      navigator.mediaSession.setActionHandler(action, (e) => player.track && fn(e));
     } catch {}
   }
 }
 
-async function exportCurrent() {
-  el.exportBtn.disabled = true;
-  const label = el.exportBtn.textContent;
-  el.exportBtn.textContent = "Getting the file ready…";
-  try {
-    const blob = await exportBook(book);
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = `${book.title.replace(/[\\/:*?"<>|]+/g, " ").trim().slice(0, 80) || "book"}.audiobook`;
-    document.body.append(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(a.href), 60_000);
-  } catch (err) {
-    alert(`Couldn't save the file: ${err.message}`);
-  } finally {
-    el.exportBtn.disabled = false;
-    el.exportBtn.textContent = label;
-  }
-}
+el.playBtn.addEventListener("click", () => {
+  if (player.playing) return player.pause();
+  player.play().catch((err) => playerStatus(err.message));
+});
+el.prevBtn.addEventListener("click", () => player.goToSentence(shownCh, player.sentence - 1));
+el.nextBtn.addEventListener("click", () => player.goToSentence(shownCh, player.sentence + 1));
+el.moreBtn.addEventListener("click", () => {
+  el.moreMenu.hidden = !el.moreMenu.hidden;
+  const e = entry(book.id);
+  el.voiceInfo.textContent = `Voice: ${voiceLabel(e.voice)} · ${formatDuration(e.seconds || 0)} in total`;
+});
 
-// ---------- events ----------
+el.seekBar.addEventListener("input", () => {
+  seeking = true;
+  el.timeNow.textContent = formatTime((el.seekBar.value / 1000) * (player.track?.duration || 0));
+});
+el.seekBar.addEventListener("change", () => {
+  seeking = false;
+  player.seek((el.seekBar.value / 1000) * (player.track?.duration || 0));
+});
+
+el.speedSel.value = String(settings.speed);
+player.setRate(settings.speed);
+el.speedSel.addEventListener("change", () => {
+  settings.speed = +el.speedSel.value;
+  player.setRate(settings.speed);
+  save();
+});
+
+// ---------- other events ----------
 
 el.fileInput.addEventListener("change", () => {
   const f = el.fileInput.files[0];
@@ -674,10 +673,7 @@ el.books.addEventListener("click", (e) => {
   if (open) openBook(open.dataset.open);
 });
 
-el.backBtn.addEventListener("click", () => {
-  if (job && !confirm("Pause preparing this book? You can continue later.")) return;
-  showLibrary();
-});
+el.backBtn.addEventListener("click", showLibrary);
 el.tocBtn.addEventListener("click", () => document.body.classList.toggle("toc-open"));
 el.scrim.addEventListener("click", () => document.body.classList.remove("toc-open"));
 el.tocList.addEventListener("click", (e) => {
@@ -690,61 +686,47 @@ el.text.addEventListener("click", (e) => {
   const go = e.target.closest("[data-goto]");
   if (go) return goToChapter(+go.dataset.goto);
   const s = e.target.closest(".s");
-  if (s && book.ready && !getSelection().toString()) player.goToSentence(shownCh, +s.dataset.i);
+  if (s && player.track && !getSelection().toString()) player.goToSentence(shownCh, +s.dataset.i);
 });
 
-el.voiceSel.addEventListener("change", () => {
-  settings.voice = el.voiceSel.value;
+el.settingsBtn.addEventListener("click", () => {
+  el.settings.hidden = !el.settings.hidden;
+  el.settingsMsg.hidden = true;
+  el.shareLinkBtn.hidden = !navigator.share;
+});
+
+function deviceLink() {
+  const c = settings.conn;
+  const d = defaults();
+  const params = new URLSearchParams({ key: c.key });
+  if (c.dataRepo !== d.dataRepo) params.set("lib", c.dataRepo);
+  if (c.appRepo !== d.appRepo) params.set("app", c.appRepo);
+  return `${location.origin}${location.pathname}#${params}`;
+}
+
+el.copyLinkBtn.addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText(deviceLink());
+    el.settingsMsg.textContent = "Copied. Open it on your other device (send it to yourself privately).";
+  } catch {
+    el.settingsMsg.textContent = deviceLink();
+  }
+  el.settingsMsg.hidden = false;
+});
+el.shareLinkBtn.addEventListener("click", () => navigator.share({ title: "Kokoro Reader", url: deviceLink() }).catch(() => {}));
+
+el.disconnectBtn.addEventListener("click", () => {
+  if (!confirm("Sign out on this device? Your library stays safe on the server.")) return;
+  delete settings.conn;
   save();
-});
-el.engineSel.addEventListener("change", () => {
-  settings.gpu = el.engineSel.value === "gpu";
-  save();
-});
-el.sampleBtn.addEventListener("click", playSample);
-el.prepareBtn.addEventListener("click", () => {
-  sampleAudio?.pause();
-  startPreparing();
-});
-el.stopBtn.addEventListener("click", async () => {
-  const id = book.id;
-  stopPreparing();
-  const made = await db.countClips(id);
-  showWork(made, null, false);
-  updateDevice(id, { done: made });
-});
-el.resumeBtn.addEventListener("click", startPreparing);
-el.restartBtn.addEventListener("click", startOver);
-el.redoBtn.addEventListener("click", startOver);
-
-el.playBtn.addEventListener("click", () => (player.playing ? player.pause() : player.play()));
-el.prevBtn.addEventListener("click", () => player.goToSentence(shownCh, player.sentence - 1));
-el.nextBtn.addEventListener("click", () => player.goToSentence(shownCh, player.sentence + 1));
-el.moreBtn.addEventListener("click", () => {
-  el.moreMenu.hidden = !el.moreMenu.hidden;
-  el.voiceInfo.textContent = `Voice: ${voiceLabel(book.voice)} · ${formatDuration(book.seconds || 0)} in total`;
-});
-el.exportBtn.addEventListener("click", exportCurrent);
-
-el.seekBar.addEventListener("input", () => {
-  seeking = true;
-  el.timeNow.textContent = formatTime((el.seekBar.value / 1000) * (player.track?.duration || 0));
-});
-el.seekBar.addEventListener("change", () => {
-  seeking = false;
-  player.seek((el.seekBar.value / 1000) * (player.track?.duration || 0));
-});
-
-el.speedSel.value = String(settings.speed);
-player.setRate(settings.speed);
-el.speedSel.addEventListener("change", () => {
-  settings.speed = +el.speedSel.value;
-  player.setRate(settings.speed);
-  save();
+  cloud = null;
+  library = { books: {} };
+  db.saveLibrary(library);
+  showConnect();
 });
 
 document.addEventListener("keydown", (e) => {
-  if (!book?.ready || el.bookScreen.hidden || e.target.closest("input, select, button")) return;
+  if (!player.track || el.bookScreen.hidden || e.target.closest("input, select, button")) return;
   if (e.code === "Space") {
     e.preventDefault();
     player.playing ? player.pause() : player.play();
@@ -752,56 +734,19 @@ document.addEventListener("keydown", (e) => {
   else if (e.code === "ArrowRight") player.skip(15);
 });
 
-window.addEventListener("beforeunload", (e) => {
-  if (job) e.preventDefault();
-});
-
-// Sync settings
-function fillSyncForm() {
-  el.syncRepo.value = settings.sync?.repo || "";
-  el.syncToken.value = settings.sync?.token || "";
-  el.deviceName.value = settings.deviceName || "";
-  el.syncOff.hidden = !sync.syncConfig(settings);
-}
-
-function syncMsg(text, ok) {
-  el.syncMsg.textContent = text;
-  el.syncMsg.hidden = !text;
-  el.syncMsg.className = `small ${ok ? "ok" : "error"}`;
-}
-
-el.syncSave.addEventListener("click", async () => {
-  const repo = el.syncRepo.value.trim().replace(/^https?:\/\/github\.com\//, "").replace(/\.git$|\/$/g, "");
-  const token = el.syncToken.value.trim();
-  settings.deviceName = el.deviceName.value.trim() || settings.deviceName;
-  if (!/^[\w.-]+\/[\w.-]+$/.test(repo) || !token) return syncMsg("Enter the repository as owner/name, and the token.");
-  settings.sync = { repo, token };
-  save();
-  for (const e of Object.values(library.books)) if (e.devices?.[me.id]) e.devices[me.id].name = settings.deviceName;
-  el.syncSave.disabled = true;
-  syncMsg("Connecting…", true);
-  const result = await syncNow();
-  el.syncSave.disabled = false;
-  if (result === true) syncMsg("Connected. This device now shares its library.", true);
-  else syncMsg(result?.message || "Couldn't sync.");
-  fillSyncForm();
-});
-
-el.syncOff.addEventListener("click", () => {
-  delete settings.sync;
-  settings.lastSync = 0;
-  save();
-  fillSyncForm();
-  showSyncState();
-  syncMsg("Sync is off. Your library stays on this device.", true);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") syncNow(); // leaving: save where you are
+  else if (cloud) syncSoon(500);
 });
 
 function esc(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 }
 
-fillSyncForm();
-showSyncState();
-await adoptLocalBooks();
-renderBooks();
-syncNow();
+// ---------- start ----------
+
+takeKeyFromLink();
+if (settings.conn?.key) {
+  cloud = new Library(settings.conn);
+  showLibrary();
+} else showConnect();

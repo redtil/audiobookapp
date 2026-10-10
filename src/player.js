@@ -1,55 +1,47 @@
-import * as db from "./db.js";
-import { buildWav, SAMPLE_RATE } from "./audio.js";
+// Plays a book chapter by chapter. Each chapter is one MP3 with the start
+// time of every sentence, fetched from the library and kept on the device
+// (Cache Storage) so chapters already heard play offline.
 
-const PAUSE_SENTENCE = 0.28;
-const PAUSE_PARAGRAPH = 0.65;
-const PAUSE_CHAPTER = 1.5;
+const CACHE = "kokoro-reader-audio";
 
-// Each chapter plays as one continuous track built from its saved sentence
-// clips. One long track keeps playing with the phone locked, which a
-// sentence-by-sentence player can't do.
-async function buildChapter(book, ch) {
-  const clips = await db.chapterClips(book.id, ch);
-  const lastOfPara = [];
-  for (const para of book.chapters[ch].paras) para.forEach((_, k) => lastOfPara.push(k === para.length - 1));
-  if (clips.length !== lastOfPara.length) throw new Error("Part of this chapter's audio is missing. Prepare the book again.");
-  const parts = clips.map((data, i) => ({
-    data,
-    pauseAfter: i === clips.length - 1 ? PAUSE_CHAPTER : lastOfPara[i] ? PAUSE_PARAGRAPH : PAUSE_SENTENCE,
-  }));
-  const { blob, starts, duration } = buildWav(parts);
-  return { ch, url: URL.createObjectURL(blob), starts, duration };
-}
-
-export async function bookSeconds(book) {
-  let total = 0;
-  for (let ch = 0; ch < book.chapters.length; ch++) {
-    for (const c of await db.chapterClips(book.id, ch)) total += c.length / SAMPLE_RATE + PAUSE_SENTENCE;
-  }
-  return total;
+async function cached(sha, fetchBlob) {
+  let cache = null;
+  try {
+    cache = await caches.open(CACHE);
+    const hit = await cache.match(`/audio/${sha}`);
+    if (hit) return hit.blob();
+  } catch {}
+  const blob = await fetchBlob(sha);
+  try {
+    await cache?.put(`/audio/${sha}`, new Response(blob));
+  } catch {}
+  return blob;
 }
 
 export class Player {
-  constructor(audio, { onSentence, onChapter, onState, onTime, onFinished }) {
+  constructor(audio, handlers) {
     this.audio = audio;
     this.audio.preservesPitch = true;
-    this.on = { onSentence, onChapter, onState, onTime, onFinished };
+    this.on = handlers; // onSentence, onChapter, onState, onTime, onFinished, onLoading
     this.book = null;
-    this.track = null;
+    this.index = null; // { [ch]: { mp3, json } } blob ids
+    this.fetchBlob = null;
+    this.track = null; // { ch, url, starts, duration }
     this.nextTrack = null;
     this.sentence = -1;
     this.rate = 1;
-
     audio.addEventListener("timeupdate", () => this.tick());
     audio.addEventListener("seeked", () => this.tick());
-    audio.addEventListener("play", () => onState?.(true));
-    audio.addEventListener("pause", () => onState?.(false));
+    audio.addEventListener("play", () => this.on.onState?.(true));
+    audio.addEventListener("pause", () => this.on.onState?.(false));
     audio.addEventListener("ended", () => this.chapterEnded());
   }
 
-  async open(book, ch, sentence = 0) {
+  async open(book, index, fetchBlob, ch, sentence = 0) {
     this.close();
     this.book = book;
+    this.index = index;
+    this.fetchBlob = fetchBlob;
     await this.loadChapter(ch, sentence);
   }
 
@@ -65,41 +57,57 @@ export class Player {
     return !this.audio.paused;
   }
 
+  async build(ch) {
+    const ids = this.index[ch];
+    if (!ids) throw new Error("This chapter's audio is missing.");
+    const [mp3, json] = await Promise.all([cached(ids.mp3, this.fetchBlob), cached(ids.json, this.fetchBlob)]);
+    const { starts, duration } = JSON.parse(await json.text());
+    return { ch, url: URL.createObjectURL(new Blob([mp3], { type: "audio/mpeg" })), starts, duration };
+  }
+
   async loadChapter(ch, sentence = 0, { autoplay = false } = {}) {
     const book = this.book;
     let t = this.nextTrack?.ch === ch ? this.nextTrack : null;
     if (t) this.nextTrack = null;
-    else t = await buildChapter(book, ch);
+    else {
+      this.on.onLoading?.(true);
+      try {
+        t = await this.build(ch);
+      } finally {
+        this.on.onLoading?.(false);
+      }
+    }
     if (book !== this.book) return URL.revokeObjectURL(t.url);
     if (this.track) URL.revokeObjectURL(this.track.url);
     this.track = t;
     this.sentence = -1;
     this.audio.src = t.url;
-    this.audio.playbackRate = this.rate;
     this.on.onChapter?.(ch);
     await new Promise((r) => this.audio.addEventListener("loadedmetadata", r, { once: true }));
-    this.audio.currentTime = t.starts[Math.min(sentence, t.starts.length - 1)] ?? 0;
     this.audio.playbackRate = this.rate;
+    this.audio.currentTime = t.starts[Math.min(sentence, t.starts.length - 1)] ?? 0;
     this.tick();
     if (autoplay) await this.play();
+    else this.prefetchNext();
   }
 
-  // Build the next chapter ahead of time, so moving on to it is instant
-  // (a locked phone may not give the page time to build it later).
-  async prebuildNext() {
+  // Fetch the next chapter ahead of time, so moving on to it is instant
+  // (a locked phone may not give the page time to fetch it later).
+  async prefetchNext() {
     const ch = this.track.ch + 1;
     if (ch >= this.book.chapters.length || this.nextTrack?.ch === ch) return;
     const book = this.book;
-    const t = await buildChapter(book, ch).catch(() => null);
+    const t = await this.build(ch).catch(() => null);
     if (!t) return;
-    if (book !== this.book || this.track?.ch !== ch - 1) return URL.revokeObjectURL(t.url);
+    if (book !== this.book || this.track?.ch !== ch - 1 || this.nextTrack) return URL.revokeObjectURL(t.url);
     this.nextTrack = t;
   }
 
   async play() {
+    if (!this.track) return;
     try {
       await this.audio.play();
-      if (!this.nextTrack) this.prebuildNext();
+      this.prefetchNext();
     } catch (err) {
       if (err.name !== "AbortError") throw err;
     }
@@ -141,17 +149,13 @@ export class Player {
   chapterEnded() {
     const ch = this.track.ch + 1;
     if (ch < this.book.chapters.length) this.loadChapter(ch, 0, { autoplay: true });
-    else {
-      this.on.onState?.(false);
-      this.on.onFinished?.();
-    }
+    else this.on.onFinished?.();
   }
 
   tick() {
     const t = this.track;
     if (!t) return;
     const now = this.audio.currentTime;
-    // Last sentence that started at or before now.
     let lo = 0;
     let hi = t.starts.length - 1;
     while (lo < hi) {
@@ -161,7 +165,7 @@ export class Player {
     }
     if (lo !== this.sentence) {
       this.sentence = lo;
-      this.on.onSentence?.(t.ch, lo, now);
+      this.on.onSentence?.(t.ch, lo);
     }
     this.on.onTime?.(now, t.duration);
   }

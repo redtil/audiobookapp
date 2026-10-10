@@ -2,3 +2,4 @@ node_modules
 dist
 public/ort
 public/model
+public/samples

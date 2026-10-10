@@ -1,32 +1,37 @@
 # Kokoro Reader
 
-Turn a PDF or EPUB into an audiobook with a natural-sounding voice, then listen to it on your phone or laptop.
+Turn a PDF or EPUB into an audiobook with a natural-sounding voice, and listen on your phone or laptop.
 
-1. **Add a book.** The text is split into chapters and sentences.
-2. **Prepare it.** Choose a voice (you can hear a sample first), then the whole book is turned into audio with [Kokoro](https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX), an open-source voice model that runs in your browser. You can pause and continue any time, even after closing the page.
-3. **Listen.** Once it's ready it plays like an audiobook: play/pause, skip by sentence, a seek bar, speed from 0.8× to 2×, and lock-screen controls. Each sentence is highlighted as it's read; tap any sentence to jump to it.
+1. **Add a book.** It's split into chapters and sentences and saved to your library.
+2. **Prepare it.** Pick a voice (tap "Hear it" for a sample). The whole book is turned into audio **on the server**: you can close the app, and it keeps going. You can pause and continue it.
+3. **Listen** on any device: play/pause, skip by sentence, seek, speed 0.8×–2×, lock-screen controls, and the sentence being read is highlighted. Where you stopped, and which books are finished, follows you between devices.
 
-## Where things are kept
+## How it works
 
-- **The app** is a static site hosted free on GitHub Pages. The voice model is published with the site (downloaded at build time by `scripts/fetch-model.mjs`), so it loads from your own site rather than Hugging Face. The browser keeps it after the first load.
-- **Books and audio** are stored in the browser on each device (IndexedDB). About 86 MB per hour of listening.
-- **Sync (optional).** To see the same library on every device (which books you have, how far you've got, which are finished, and how far each device has got preparing them), connect a private GitHub repository under "Sync your library between devices". The app saves `library.json` and each book's text there with a fine-grained token you create. Audio isn't synced because it's too big for git.
-- **Moving audio between devices.** In the player's ⋯ menu, "Save audiobook file" downloads a `.audiobook` file. Open it with "Add a book" on another device and it's ready to play straight away. This is handy for preparing on a fast laptop and listening on a phone.
+Everything runs on GitHub, for free:
 
-## How long preparing takes
+- **The app** is a static site on GitHub Pages (this repository).
+- **The library** is a private repository, `audiobook-data`:
+  - `library.json`: every book's status, position and finished state
+  - `books/<id>.json`: each book's text, split into sentences
+  - `audio/<id>/<part>` branches: one MP3 per chapter, plus the start time of each sentence
+- **Preparing** runs the [Kokoro](https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX) voice model on GitHub Actions (`.github/workflows/prepare.yml`, `server/`). A book's chapters are split across up to 20 machines at once. Each machine makes audio about 2× faster than real time, so a 10-hour book takes roughly 20–30 minutes. Actions minutes are free for public repositories. The book's text and audio only ever live in the private library; the logs here show chapter numbers and timings, never titles or text.
 
-It depends on the device. A laptop on "Graphics card" is usually many times faster than real time. A phone on CPU may take about as long as the book itself, and the page has to stay open (the app keeps the screen on while it works).
+The app talks to both repositories with one fine-grained access token, the "library key".
 
-GPU mode uses the full-precision model, which isn't bundled by default (it's ~330 MB). It's fetched from Hugging Face the first time, or you can bundle it with `node scripts/fetch-model.mjs --gpu`.
+## One-time setup
+
+1. Create a **private** repository named `audiobook-data` (tick "Add a README file").
+2. Create a [fine-grained token](https://github.com/settings/personal-access-tokens/new):
+   - Repository access → Only select repositories → `audiobook-data` and this app's repository
+   - Permissions → **Contents**: Read and write, **Actions**: Read and write
+3. In this repository: Settings → Secrets and variables → Actions → New repository secret, named `LIBRARY_KEY`, containing the token.
+4. Open the site and paste the token as your library key. On other devices, use ⚙︎ → "Copy link for another device".
 
 ## Develop
 
     npm install
-    npm run dev          # http://localhost:5173
-    npm run build        # static site in dist/
+    npm run dev                      # the app, at http://localhost:5173
+    MOCK_VOICE=1 node server/prepare.mjs plan   # the server side (see the comments in server/prepare.mjs)
 
-Add `?mock` to the URL to use a test tone instead of the real voice, for trying the app without the model.
-
-## Deploy
-
-Pushing to `main` builds and deploys to GitHub Pages (`.github/workflows/pages.yml`; set Settings → Pages → Source to "GitHub Actions"). The site appears at `https://<user>.github.io/<repo>/`.
+Locally the app can't guess the repositories from its address, so fill them in under "Advanced" on the connect screen.

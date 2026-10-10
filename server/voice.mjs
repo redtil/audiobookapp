@@ -7,7 +7,9 @@ const MODEL = "onnx-community/Kokoro-82M-v1.0-ONNX";
 export async function loadVoice({ dtype = process.env.KOKORO_DTYPE || "fp32", mock = !!process.env.MOCK_VOICE } = {}) {
   if (mock) {
     // Test tone as long as the sentence would take to say.
+    const delay = +process.env.MOCK_DELAY || 0;
     return async (text) => {
+      if (delay) await new Promise((r) => setTimeout(r, delay));
       const n = Math.round(SAMPLE_RATE * Math.max(0.3, text.length / 15));
       const out = new Float32Array(n);
       for (let i = 0; i < n; i++) out[i] = 0.2 * Math.sin((i / SAMPLE_RATE) * 2 * Math.PI * 220);
