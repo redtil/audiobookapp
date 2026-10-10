@@ -1,11 +1,11 @@
 {
-  "name": "book-reader",
+  "name": "kokoro-reader",
   "private": true,
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "node scripts/copy-ort.mjs && vite",
-    "build": "node scripts/copy-ort.mjs && vite build",
+    "dev": "node scripts/copy-ort.mjs && node scripts/fetch-model.mjs && vite",
+    "build": "node scripts/copy-ort.mjs && node scripts/fetch-model.mjs && vite build",
     "preview": "vite preview"
   },
   "dependencies": {

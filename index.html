@@ -3,13 +3,15 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-    <meta name="theme-color" content="#1c1a17" />
-    <title>Book Reader</title>
+    <meta name="theme-color" content="#f6f3ee" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#16171b" media="(prefers-color-scheme: dark)" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <title>Kokoro Reader</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎧</text></svg>" />
     <link rel="stylesheet" href="./src/style.css" />
     <script>
-      // Turn on cross-origin isolation (see coi-sw.js) so the voice can use
-      // multiple CPU cores. Reloads once the first time.
+      // Cross-origin isolation (see coi-sw.js) lets the voice use several CPU
+      // cores. The first visit reloads once to turn it on.
       if (!window.crossOriginIsolated && window.isSecureContext && "serviceWorker" in navigator) {
         navigator.serviceWorker.register("./coi-sw.js").then(() => {
           if (!navigator.serviceWorker.controller && !sessionStorage.getItem("coi-reloaded")) {
@@ -21,58 +23,140 @@
     </script>
   </head>
   <body>
-    <header class="topbar">
-      <button id="menuBtn" class="icon-btn" aria-label="Chapters" hidden>☰</button>
-      <h1 id="bookTitle">Book Reader</h1>
-      <button id="homeBtn" class="icon-btn" aria-label="Library" hidden>⌂</button>
-    </header>
+    <!-- Library -->
+    <section id="library" class="screen library">
+      <header class="lib-head">
+        <h1>Kokoro Reader</h1>
+        <p class="muted">Turn a PDF or EPUB into an audiobook with a natural voice. Everything happens on this device.</p>
+      </header>
 
-    <main id="home" class="home">
-      <label class="drop" id="drop">
-        <input id="fileInput" type="file" accept=".pdf,.epub,application/pdf,application/epub+zip" hidden />
-        <span class="drop-icon">📖</span>
-        <strong>Open a PDF or EPUB</strong>
-        <span class="muted">Tap to choose a file, or drop it here. It stays on this device.</span>
+      <label id="drop" class="drop">
+        <input id="fileInput" type="file" hidden />
+        <span class="drop-title">Add a book</span>
+        <span class="muted">PDF, EPUB, or an <em>.audiobook</em> file saved from another device</span>
       </label>
-      <p id="homeError" class="error" hidden></p>
-      <section id="librarySection" hidden>
+      <p id="libError" class="error" hidden></p>
+
+      <div class="books-head">
         <h2>Your books</h2>
-        <ul id="library" class="library"></ul>
-      </section>
-    </main>
-
-    <div id="reader" class="reader" hidden>
-      <aside id="toc" class="toc">
-        <ol id="tocList"></ol>
-      </aside>
-      <div id="scrim" class="scrim"></div>
-      <article id="page" class="page"></article>
-    </div>
-
-    <footer id="player" class="player" hidden>
-      <div id="engineStatus" class="engine-status"></div>
-      <div class="controls">
-        <button id="prevBtn" class="icon-btn" aria-label="Previous sentence">⏮</button>
-        <button id="playBtn" class="play-btn" aria-label="Play">▶</button>
-        <button id="nextBtn" class="icon-btn" aria-label="Next sentence">⏭</button>
+        <span id="syncState" class="muted small"></span>
       </div>
-      <div class="settings">
-        <select id="speedSel" aria-label="Speed">
-          <option value="0.75">0.75×</option>
-          <option value="1" selected>1×</option>
-          <option value="1.25">1.25×</option>
-          <option value="1.5">1.5×</option>
-          <option value="1.75">1.75×</option>
-          <option value="2">2×</option>
-        </select>
-        <select id="voiceSel" aria-label="Voice"></select>
-        <select id="modeSel" aria-label="Voice engine" title="Graphics card is faster but can freeze some devices">
-          <option value="cpu">Smooth (CPU)</option>
-          <option value="gpu">Fast (GPU)</option>
-        </select>
-      </div>
-    </footer>
+      <ul id="books" class="books"></ul>
+      <p id="noBooks" class="muted" hidden>No books yet.</p>
 
+      <details id="syncBox" class="sync">
+        <summary>Sync your library between devices</summary>
+        <p class="muted small">
+          Your book list, the text, where you are and what's finished are saved to a private GitHub
+          repository of yours, so every device shows the same library. Audio isn't synced (it's too big):
+          prepare it on each device, or use “Save audiobook file” and open that file on the other device.
+        </p>
+        <ol class="muted small steps">
+          <li>On GitHub, create a new <strong>private</strong> repository, e.g. <em>audiobook-data</em>.</li>
+          <li>Create a <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">fine-grained token</a>:
+            choose “Only select repositories” → that repository, and under Repository permissions set <strong>Contents</strong> to “Read and write”.</li>
+          <li>Enter both below. Do the same on each device (the same token works).</li>
+        </ol>
+        <label class="field"><span>Repository</span><input id="syncRepo" placeholder="your-name/audiobook-data" autocomplete="off" autocapitalize="off" spellcheck="false" /></label>
+        <label class="field"><span>Token</span><input id="syncToken" type="password" placeholder="github_pat_…" autocomplete="off" /></label>
+        <label class="field"><span>Name of this device</span><input id="deviceName" placeholder="e.g. Laptop" /></label>
+        <div class="row">
+          <button id="syncSave" class="btn primary">Save and sync</button>
+          <button id="syncOff" class="btn quiet">Turn off</button>
+        </div>
+        <p id="syncMsg" class="small" hidden></p>
+      </details>
+      <p id="storage" class="muted small"></p>
+    </section>
+
+    <!-- Book -->
+    <section id="bookScreen" class="screen book" hidden>
+      <header class="bar">
+        <button id="backBtn" class="icon-btn" aria-label="Back to library">‹</button>
+        <div class="bar-title">
+          <strong id="bookTitle"></strong>
+          <span id="chapterTitle" class="muted small"></span>
+        </div>
+        <button id="tocBtn" class="icon-btn" aria-label="Chapters">☰</button>
+      </header>
+
+      <div class="book-body">
+        <article id="text" class="text"></article>
+        <aside id="toc" class="toc" aria-label="Chapters"><ol id="tocList"></ol></aside>
+        <div id="scrim" class="scrim"></div>
+      </div>
+
+      <!-- Step 1: choose a voice and prepare -->
+      <footer id="setupPanel" class="panel" hidden>
+        <h2>Make the audiobook</h2>
+        <p id="setupInfo" class="muted"></p>
+        <div class="row">
+          <label class="field">
+            <span>Voice</span>
+            <select id="voiceSel"></select>
+          </label>
+          <button id="sampleBtn" class="btn">▶ Hear sample</button>
+        </div>
+        <div class="row">
+          <label class="field">
+            <span>Processing</span>
+            <select id="engineSel">
+              <option value="cpu">CPU (works everywhere)</option>
+              <option value="gpu">Graphics card (much faster on laptops)</option>
+            </select>
+          </label>
+        </div>
+        <p id="setupStatus" class="status" hidden></p>
+        <button id="prepareBtn" class="btn primary wide">Prepare audiobook</button>
+      </footer>
+
+      <!-- Step 2: preparing -->
+      <footer id="workPanel" class="panel" hidden>
+        <div class="work-head">
+          <h2 id="workTitle">Preparing…</h2>
+          <span id="workPct" class="pct">0%</span>
+        </div>
+        <div class="bar-track"><div id="workBar" class="bar-fill"></div></div>
+        <p id="workInfo" class="muted small"></p>
+        <p class="muted small">Keep this page open (the screen stays on while it works). You can pause any time and continue later.</p>
+        <div class="row">
+          <button id="stopBtn" class="btn">❚❚ Pause</button>
+          <button id="resumeBtn" class="btn primary" hidden>▶ Continue preparing</button>
+          <button id="restartBtn" class="btn quiet" hidden>Start over with another voice</button>
+        </div>
+      </footer>
+
+      <!-- Step 3: listen -->
+      <footer id="playerPanel" class="panel player" hidden>
+        <div class="seek">
+          <span id="timeNow" class="time">0:00</span>
+          <input id="seekBar" type="range" min="0" max="1000" value="0" aria-label="Position in chapter" />
+          <span id="timeLeft" class="time">0:00</span>
+        </div>
+        <div class="controls">
+          <select id="speedSel" class="speed" aria-label="Speed">
+            <option value="0.8">0.8×</option>
+            <option value="1" selected>1×</option>
+            <option value="1.15">1.15×</option>
+            <option value="1.3">1.3×</option>
+            <option value="1.5">1.5×</option>
+            <option value="1.75">1.75×</option>
+            <option value="2">2×</option>
+          </select>
+          <button id="prevBtn" class="icon-btn big" aria-label="Previous sentence">⏮</button>
+          <button id="playBtn" class="play" aria-label="Play">▶</button>
+          <button id="nextBtn" class="icon-btn big" aria-label="Next sentence">⏭</button>
+          <button id="moreBtn" class="icon-btn big" aria-label="More">⋯</button>
+        </div>
+        <div id="moreMenu" class="more" hidden>
+          <p id="voiceInfo" class="muted small"></p>
+          <button id="exportBtn" class="btn">Save audiobook file (to open on another device)</button>
+          <button id="redoBtn" class="btn quiet">Make it again with another voice</button>
+        </div>
+      </footer>
+    </section>
+
+    <audio id="audio" preload="auto"></audio>
     <script type="module" src="./src/main.js"></script>
   </body>
 </html>
