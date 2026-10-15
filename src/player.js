@@ -18,6 +18,20 @@ export async function cached(sha, fetchBlob) {
   return blob;
 }
 
+// Free the space a book's audio takes on this device. all: what the library
+// has for the book ({ chapters, music, moods }, see cloud.audioAll).
+export async function forgetAudio(all) {
+  const shas = [
+    ...Object.values(all?.chapters || {}).flatMap((c) => [c.mp3, c.json, ...Object.values(c.mix || {})]),
+    ...Object.values(all?.music || {}),
+    all?.moods,
+  ].filter(Boolean);
+  try {
+    const cache = await caches.open(CACHE);
+    await Promise.all(shas.map((sha) => cache.delete(`/audio/${sha}`)));
+  } catch {}
+}
+
 export class Player {
   constructor(audio, handlers) {
     this.audio = audio;

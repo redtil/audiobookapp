@@ -1,7 +1,7 @@
 import { readBook, bookIdFor } from "./book.js";
 import * as db from "./db.js";
 import { Library, mergeLibraries, isRemoved } from "./cloud.js";
-import { Player, cached } from "./player.js";
+import { Player, cached, forgetAudio } from "./player.js";
 import { VOICES, voiceLabel } from "./voices.js";
 import { formatTime, formatDuration } from "./format.js";
 import { estimateSeconds } from "./plan.js";
@@ -329,12 +329,15 @@ function showLibError(err) {
 async function removeBook(id) {
   const e = entry(id);
   if (!e || !confirm(`Remove "${e.title}" and its audio from your library?`)) return;
+  // What there is for the book, to clear from this device once it's gone.
+  const all = await cloud.audioAll(id).catch(() => ({ chapters: (book?.id === id && book.index) || {} }));
   try {
     await cloud.pause(id);
     await cloud.deleteBook(id);
   } catch (err) {
     return showLibError(err);
   }
+  await forgetAudio(all);
   await db.deleteBook(id);
   updateEntry(id, { deletedAt: Date.now() }, 0);
   renderBooks();
@@ -610,6 +613,7 @@ el.resumeBtn.addEventListener("click", () => startPreparing(entry(book.id).voice
 async function startOver() {
   if (!confirm("Delete this book's audio and choose a voice again?")) return;
   const id = book.id;
+  const all = await cloud.audioAll(id).catch(() => ({ chapters: book.index }));
   try {
     await cloud.pause(id);
     await cloud.deleteAudio(id);
@@ -617,6 +621,7 @@ async function startOver() {
     return alert(err.message);
   }
   player.close();
+  await forgetAudio(all);
   delete status[id];
   delete book.index;
   db.putBook(book);
