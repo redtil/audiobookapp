@@ -35,3 +35,8 @@ The app talks to both repositories with one fine-grained access token, the "libr
     MOCK_VOICE=1 node server/prepare.mjs plan   # the server side (see the comments in server/prepare.mjs)
 
 Locally the app can't guess the repositories from its address, so fill them in under "Advanced" on the connect screen.
+
+## Credits
+
+- Voice: [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) (Apache 2.0) via [kokoro-js](https://github.com/hexgrad/kokoro).
+- `public/words-en.txt`, used to put spaces back into words some PDFs run together: the English word-frequency list from [wordninja](https://github.com/keredson/wordninja) / [wordsninja](https://github.com/parsakafi/wordsninja) (MIT).

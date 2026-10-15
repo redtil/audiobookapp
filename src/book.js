@@ -1,4 +1,5 @@
 import JSZip from "jszip";
+import { unglueChapters } from "./unglue.js";
 import * as pdfjs from "pdfjs-dist/legacy/build/pdf.mjs";
 import pdfWorkerUrl from "pdfjs-dist/legacy/build/pdf.worker.min.mjs?url";
 
@@ -12,7 +13,10 @@ export async function readBook(file) {
   const name = file.name.toLowerCase();
   let raw;
   if (name.endsWith(".epub")) raw = await readEpub(file);
-  else if (name.endsWith(".pdf")) raw = await readPdf(file);
+  else if (name.endsWith(".pdf")) {
+    raw = await readPdf(file);
+    await unglueChapters(raw.chapters);
+  }
   else throw new Error("Please choose a PDF or EPUB file.");
 
   const chapters = raw.chapters
@@ -131,16 +135,24 @@ async function epubToc(zip, opf, items, xml) {
 async function pdfPageText(page) {
   const { items } = await page.getTextContent();
   let out = "";
-  let lastY = null;
+  let last = null; // { y, end, charWidth } of the previous piece of text
   for (const it of items) {
-    if (!("str" in it)) continue;
+    if (!("str" in it) || !it.str) continue;
+    const x = it.transform[4];
     const y = it.transform[5];
-    if (lastY !== null && Math.abs(y - lastY) > 2) {
+    const charWidth = it.width / Math.max(1, it.str.length);
+    if (last && Math.abs(y - last.y) > 2) {
       const size = it.height || Math.abs(it.transform[3]) || 12;
-      out += Math.abs(lastY - y) > size * 1.8 ? "\n\n" : "\n";
+      out += Math.abs(last.y - y) > size * 1.8 ? "\n\n" : "\n";
+    } else if (last && !/\s$/.test(out) && !/^\s/.test(it.str)) {
+      // Many PDFs (scanned books with a text layer especially) place each
+      // word separately without a space character: the gap is the space.
+      // A gap of a third of a letter or more (or jumping back) is a word break.
+      const gap = x - last.end;
+      if (gap > 0.3 * Math.min(charWidth, last.charWidth) || gap < -charWidth) out += " ";
     }
     out += it.str;
-    lastY = y;
+    last = { y, end: x + it.width, charWidth };
   }
   return out;
 }
