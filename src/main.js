@@ -264,7 +264,12 @@ function renderBooks() {
     const tags = [];
     const st = status[e.id];
     const pct = st ? Math.floor(progress(e, st) * 100) : 0;
-    if (e.ready) {
+    const rm = removing[e.id];
+    if (rm?.error) tags.push(`<span class="tag warn">Couldn't remove it: ${esc(rm.error)}. Tap ✕ to try again.</span>`);
+    else if (rm) {
+      const parts = rm.total ? ` · ${rm.done} of ${rm.total} parts` : "";
+      tags.push(`<span class="tag busy"><span class="spinner" aria-hidden="true"></span>Removing${rm.step ? ` ${rm.step}` : "…"}${parts}</span>`);
+    } else if (e.ready) {
       tags.push(`<span class="tag ready">Ready · ${formatDuration(e.seconds || 0)}</span>`);
       if (e.finished) tags.push(`<span class="tag done">Finished</span>`);
       else if (e.pos && (e.pos.ch || e.pos.i)) tags.push(`<span class="tag">Paused at chapter ${e.pos.ch + 1} of ${e.chapters}</span>`);
@@ -278,9 +283,10 @@ function renderBooks() {
     }
     else if (st.failed) tags.push(`<span class="tag">Stopped at ${pct}% · open to continue</span>`);
     else tags.push(`<span class="tag">Paused · ${pct}%</span>`);
-    return `<li>
-      <button class="open" data-open="${esc(e.id)}"><strong>${esc(e.title)}</strong><span class="tags">${tags.join("")}</span></button>
-      <button class="icon-btn remove" data-remove="${esc(e.id)}" aria-label="Remove ${esc(e.title)}">✕</button>
+    const busy = rm && !rm.error;
+    return `<li class="${busy ? "removing" : ""}">
+      <button class="open" data-open="${esc(e.id)}"${busy ? " disabled" : ""}><strong>${esc(e.title)}</strong><span class="tags">${tags.join("")}</span></button>
+      <button class="icon-btn remove" data-remove="${esc(e.id)}" aria-label="Remove ${esc(e.title)}"${busy ? " disabled" : ""}>✕</button>
     </li>`;
   }).join("");
   el.noBooks.hidden = entries.length > 0;
@@ -326,21 +332,44 @@ function showLibError(err) {
   el.libError.hidden = false;
 }
 
+// Books being removed: id -> { step, done, total, error }.
+const removing = {};
+
+function libNotice(text) {
+  el.libNotice.textContent = text;
+  el.libNotice.hidden = !text;
+  clearTimeout(libNotice.timer);
+  if (text) libNotice.timer = setTimeout(() => (el.libNotice.hidden = true), 6000);
+}
+
 async function removeBook(id) {
   const e = entry(id);
-  if (!e || !confirm(`Remove "${e.title}" and its audio from your library?`)) return;
-  // What there is for the book, to clear from this device once it's gone.
-  const all = await cloud.audioAll(id).catch(() => ({ chapters: (book?.id === id && book.index) || {} }));
+  if (!e || (removing[id] && !removing[id].error)) return;
+  if (!confirm(`Remove "${e.title}" and its audio from your library?`)) return;
+  const show = (changes) => {
+    removing[id] = { ...removing[id], ...changes };
+    renderBooks();
+  };
+  show({ step: "…", done: 0, total: 0, error: null });
   try {
+    // What there is for the book, to clear from this device once it's gone.
+    const all = await cloud.audioAll(id).catch(() => ({ chapters: {} }));
+    show({ step: "(stopping any preparing)" });
     await cloud.pause(id);
-    await cloud.deleteBook(id);
+    show({ step: "the audio" });
+    await cloud.deleteBook(id, (done, total) => show({ done, total }));
+    show({ step: "from this device", total: 0 });
+    await forgetAudio(all);
+    await db.deleteBook(id);
   } catch (err) {
-    return showLibError(err);
+    console.error(err);
+    show({ error: err.message || "something went wrong" });
+    return;
   }
-  await forgetAudio(all);
-  await db.deleteBook(id);
+  delete removing[id];
   updateEntry(id, { deletedAt: Date.now() }, 0);
   renderBooks();
+  libNotice(`Removed "${e.title}" and its audio.`);
 }
 
 // ---------- book screen ----------

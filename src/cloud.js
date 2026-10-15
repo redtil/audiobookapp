@@ -100,8 +100,9 @@ export class Library {
     return res.json();
   }
 
-  async deleteBook(id) {
-    await this.deleteAudio(id);
+  // onProgress(done, total) as the book's audio is deleted, part by part.
+  async deleteBook(id, onProgress) {
+    await this.deleteAudio(id, onProgress);
     const file = await this.call(`/repos/${this.dataRepo}/contents/books/${id}.json`, { ok404: true });
     if (file) {
       await this.call(`/repos/${this.dataRepo}/contents/books/${id}.json`, {
@@ -144,11 +145,19 @@ export class Library {
     return (await this.call(`/repos/${this.dataRepo}/git/blobs/${sha}`, { raw: true })).blob();
   }
 
-  async deleteAudio(id) {
+  async deleteAudio(id, onProgress) {
     const refs = (await this.call(`/repos/${this.dataRepo}/git/matching-refs/heads/audio/${id}/`)) || [];
-    for (const r of refs) {
-      await this.call(`/repos/${this.dataRepo}/git/${r.ref}`, { method: "DELETE", ok404: true });
-    }
+    let done = 0;
+    onProgress?.(0, refs.length);
+    // A few at a time: quicker, without hammering the server.
+    const queue = [...refs];
+    const worker = async () => {
+      for (let r; (r = queue.shift()); ) {
+        await this.call(`/repos/${this.dataRepo}/git/${r.ref}`, { method: "DELETE", ok404: true });
+        onProgress?.(++done, refs.length);
+      }
+    };
+    await Promise.all([worker(), worker(), worker(), worker()]);
   }
 
   // ---------- preparing ----------

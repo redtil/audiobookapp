@@ -299,3 +299,15 @@ h1, h2 { margin: 0; }
 .ticks i { font-style: normal; width: 0; display: flex; justify-content: center; white-space: nowrap; }
 .ticks i:first-child { justify-content: flex-start; }
 .ticks i:last-child { justify-content: flex-end; }
+
+.notice { margin: 0; padding: 10px 14px; border-radius: 10px; background: var(--mark); color: var(--text); }
+.tag.warn { background: none; border: 1px solid var(--error); color: var(--error); }
+.books li.removing { opacity: 0.75; }
+.books li.removing .open { cursor: default; }
+.spinner {
+  display: inline-block; width: 0.8em; height: 0.8em; margin-right: 6px; vertical-align: -0.1em;
+  border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 2.4s; } }
