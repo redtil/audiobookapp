@@ -463,7 +463,7 @@ function markSentence(i) {
   marked.classList.add("now");
   const r = marked.getBoundingClientRect();
   const box = el.text.getBoundingClientRect();
-  if (r.top < box.top + 40 || r.bottom > box.bottom - 40) marked.scrollIntoView({ block: "center", behavior: "smooth" });
+  if (r.top < box.top + 40 || r.bottom > box.bottom - 40) marked.scrollIntoView({ block: "center", inline: "nearest", behavior: "smooth" });
 }
 
 function goToChapter(ch) {

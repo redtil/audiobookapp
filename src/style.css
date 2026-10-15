@@ -134,7 +134,7 @@ h1, h2 { margin: 0; }
 }
 .bar-title { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .bar-title > * { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.book-body { flex: 1; min-height: 0; position: relative; display: flex; }
+.book-body { flex: 1; min-height: 0; position: relative; display: flex; overflow: hidden; overflow: clip; }
 .text {
   flex: 1;
   overflow-y: auto;
@@ -271,4 +271,25 @@ h1, h2 { margin: 0; }
 .switch-row { display: flex; align-items: center; gap: 10px; min-height: 44px; cursor: pointer; }
 .switch-row input { width: 22px; height: 22px; accent-color: var(--accent); }
 .slider input { accent-color: var(--accent); padding: 0; min-height: 32px; border: none; background: none; }
-#musicBtn.on { color: var(--accent); }
+/* Music button: a labelled pill, filled when music is on. */
+.music-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-width: 52px;
+  height: 48px;
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+  line-height: 1;
+}
+.music-btn .note { font-size: 1.25rem; }
+.music-btn .lbl { font-size: 0.68rem; margin-top: 3px; color: var(--muted); }
+.music-btn.on { background: var(--mark); border-color: var(--accent); color: var(--accent); }
+.music-btn.on .lbl { color: var(--accent); }
+@media (max-width: 380px) {
+  .controls { gap: 4px; }
+  .speed { width: 64px; }
+}
