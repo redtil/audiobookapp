@@ -399,6 +399,7 @@ async function openPlayer() {
       db.putBook(book);
     }
     const pos = e.pos || { ch: 0, i: 0 };
+    player.withMusic = settings.music;
     await player.open(book, book.index, (sha) => cloud.blob(sha), Math.min(pos.ch, book.chapters.length - 1), pos.i);
     updateMetadata();
     music.clearClips();
@@ -619,40 +620,67 @@ el.redoBtn.addEventListener("click", startOver);
 const music = new MusicEngine();
 music.setVolume(settings.musicVolume);
 
-// The mood of a chapter: from the server's reading of the book when it has
-// one, otherwise a quick guess from its words.
-function moodOf(ch) {
+// The mood at a sentence: from the server's reading of the book when it has
+// one (it changes within chapters as the story does), otherwise a quick guess
+// from the chapter's words.
+function moodAt(ch, i = 0) {
   if (!book) return "reflective";
+  const segments = book.segments?.[ch];
+  if (segments?.length) {
+    let mood = segments[0].mood;
+    for (const seg of segments) if (seg.at <= i) mood = seg.mood;
+    return mood;
+  }
   return book.moods?.[ch] || (book.guessedMoods ??= {})[ch] || (book.guessedMoods[ch] = chapterMood(book.chapters[ch]));
 }
 
+// This chapter's narration already has its music mixed in.
+const mixedHere = () => !!player.track?.mixed;
+
 function syncMusic() {
-  const on = settings.music && player.playing;
   el.musicBtn.classList.toggle("on", settings.music);
-  if (on) music.play(moodOf(shownCh));
+  // The live composer only fills in where the narration has no music of its own.
+  const live = settings.music && player.playing && !mixedHere();
+  const mood = moodAt(shownCh, Math.max(0, player.sentence));
+  if (live) music.play(mood);
   else music.pause();
-  const mood = moodOf(shownCh);
-  const how = book?.musicFiles?.[mood] ? "composed for this book" : "composed live on this device";
-  el.musicNow.textContent = settings.music ? `Now: ${MOODS[mood]?.label || ""}, ${how} (chapter ${shownCh + 1}).` : "";
-  el.composeBtn.hidden = !book || !!book.moods || composing.has(book?.id);
+  const label = MOODS[mood]?.label || "";
+  el.musicNow.textContent = !settings.music ? ""
+    : mixedHere() ? `Now: ${label}. The music is part of the narration and follows the story.`
+    : `Now: ${label}, composed live on this device.`;
+  el.musicVolRow.hidden = mixedHere();
+  const hasMix = Object.values(book?.index || {}).some((c) => c.mix);
+  el.composeBtn.hidden = !book || hasMix || composing.has(book.id);
 }
 
-// The moods and music the server made for this book, if any. Loaded in the
-// background when a book opens; until then the live composer plays.
+// What the server made for this book: mood segments, composed music, and
+// chapters mixed with music. Checked in the background whenever a book opens,
+// so music added since last time is picked up.
 const composing = new Set();
 async function loadBookMusic(myBook) {
   try {
     const all = await cloud.audioAll(myBook.id);
     if (book !== myBook) return;
-    if (all.moods) myBook.moods = JSON.parse(await (await cached(all.moods, (s) => cloud.blob(s))).text()).moods;
+    if (all.moods) {
+      const moods = JSON.parse(await (await cached(all.moods, (s) => cloud.blob(s))).text());
+      myBook.moods = moods.moods;
+      myBook.segments = moods.chapters;
+    }
+    // Newly mixed chapters.
+    const before = JSON.stringify(myBook.index);
+    myBook.index = all.chapters;
+    if (JSON.stringify(myBook.index) !== before) {
+      db.putBook(myBook);
+      player.updateIndex(all.chapters);
+    }
+    if (Object.values(all.chapters).some((c) => c.mix)) composing.delete(myBook.id);
+    // Composed music, for the live player in chapters that aren't mixed yet.
     const files = {};
     for (const [mood, sha] of Object.entries(all.music)) {
       files[mood] = await (await cached(sha, (s) => cloud.blob(s))).arrayBuffer();
     }
     if (book !== myBook) return;
-    myBook.musicFiles = all.music;
     if (Object.keys(files).length) await music.setClips(files);
-    if (all.moods) composing.delete(myBook.id);
     syncMusic();
   } catch (err) {
     console.warn("Couldn't load the book's music", err);
@@ -670,6 +698,10 @@ const player = new Player(el.audio, {
   onSentence: (ch, i) => {
     if (!book) return;
     markSentence(i);
+    if (settings.music && !mixedHere()) {
+      music.setMood(moodAt(ch, i));
+      el.musicNow.textContent = `Now: ${MOODS[moodAt(ch, i)]?.label || ""}, composed live on this device.`;
+    }
     updateEntry(book.id, { pos: { ch, i, at: Date.now() } }, 60_000);
   },
   onState: (playing) => {
@@ -746,10 +778,11 @@ el.musicBtn.addEventListener("click", () => {
   el.musicVol.value = Math.round(settings.musicVolume * 100);
   syncMusic();
 });
-el.musicOn.addEventListener("change", () => {
+el.musicOn.addEventListener("change", async () => {
   settings.music = el.musicOn.checked;
   save();
   if (settings.music) music.ensure();
+  await player.setWithMusic(settings.music);
   syncMusic();
 });
 el.composeBtn.addEventListener("click", async () => {
@@ -759,7 +792,7 @@ el.composeBtn.addEventListener("click", async () => {
     // Preparing again only does what's missing: here, the moods and music.
     await cloud.startPreparing(id, entry(id).voice || settings.voice);
     composing.add(id);
-    el.composeInfo.textContent = "Composing on the server. It takes a while; the music switches over by itself next time you open the book.";
+    el.composeInfo.textContent = "Adding music on the server: about 10 to 20 minutes. It switches on by itself next time you open the book.";
   } catch (err) {
     el.composeInfo.textContent = err.message;
   } finally {

@@ -26,12 +26,14 @@ env:
   DATA_REPO: ${{ inputs.library }}
   BOOK: ${{ inputs.book }}
   VOICE: ${{ inputs.voice }}
+  MUSIC: ${{ inputs.music }}
 jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
       parts: ${{ steps.plan.outputs.parts }}
       count: ${{ steps.plan.outputs.count }}
+      mixparts: ${{ steps.plan.outputs.mixparts }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -82,7 +84,7 @@ jobs:
       - id: moods
         run: node server/music.mjs moods
 
-  # Composes the music for each mood the book has, one machine per mood.
+  # Composes two versions of each mood the book has, one machine each.
   compose:
     needs: moods
     if: needs.moods.outputs.compose != '[]' && needs.moods.outputs.compose != ''
@@ -91,7 +93,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mood: ${{ fromJSON(needs.moods.outputs.compose) }}
+        include: ${{ fromJSON(needs.moods.outputs.compose) }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -102,3 +104,26 @@ jobs:
       - run: node server/music.mjs compose
         env:
           MOOD: ${{ matrix.mood }}
+          VARIANT: ${{ matrix.variant }}
+
+  # Mixes the music into the narration, following the book's moods, once the
+  # voice and the music are both made.
+  mix:
+    needs: [plan, work, moods, compose]
+    if: ${{ !cancelled() && inputs.music == 'yes' && needs.moods.result == 'success' && needs.plan.outputs.mixparts != '[]' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.mixparts) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --omit=dev --ignore-scripts
+      - run: node server/prepare.mjs mix
+        env:
+          CHAPTERS: ${{ matrix.chapters }}
+          PART: mix-${{ github.run_id }}-${{ matrix.part }}

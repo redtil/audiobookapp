@@ -1,17 +1,23 @@
 // A book's background music, made on GitHub's machines.
 //
-//   node server/music.mjs moods     read the book and save each chapter's mood
-//                                   (moods.json); outputs the moods that still
-//                                   need music
-//   node server/music.mjs compose   compose the music for one mood (MOOD)
+//   node server/music.mjs moods     read the book and save where its mood
+//                                   changes (moods.json); outputs the music
+//                                   still to compose
+//   node server/music.mjs compose   compose one version (VARIANT) of one mood (MOOD)
 //
 // Music is composed by MusicGen (Meta; weights CC BY-NC 4.0, fine for
 // personal listening) from a description of the mood, made to loop
-// seamlessly, and saved as music-<mood>.mp3 on the book's audio branches.
+// seamlessly, and saved on the book's audio branches as
+// music-<mood>-<variant>.mp3 (for the app) and .pcm (16-bit, 24 kHz, for
+// mixing into the narration; see mix.mjs).
 
 import { Mp3Encoder } from "@breezystack/lamejs";
 import { readBook, audioFiles, readBlob, ownBranch, output } from "./library.mjs";
 import { bookMoods, EMOTION_MODEL } from "./moods.mjs";
+import { resample } from "./mix.mjs";
+import { SAMPLE_RATE } from "./voice.mjs";
+
+export const VARIANTS = ["a", "b"];
 
 const SECONDS = +process.env.MUSIC_SECONDS || 30;
 
@@ -32,9 +38,8 @@ export const PROMPTS = {
 async function moods() {
   const book = await readBook();
   const files = await audioFiles();
-  let list;
-  if (files["moods.json"]) {
-    list = JSON.parse(await readBlob(files["moods.json"])).moods;
+  let result = files["moods.json"] && JSON.parse(await readBlob(files["moods.json"]));
+  if (result?.chapters) {
     console.log("moods already read");
   } else {
     let classify;
@@ -48,14 +53,14 @@ async function moods() {
       classify = (sentences) => classifier(sentences, { top_k: null }).then((r) => (Array.isArray(r[0]) ? r : [r]));
     }
     const started = performance.now();
-    list = await bookMoods(book, classify);
+    result = await bookMoods(book, classify);
     console.log(`read ${book.chapters.length} chapters in ${((performance.now() - started) / 1000).toFixed(0)} s`);
-    await ownBranch("moods").save({ "moods.json": JSON.stringify({ moods: list }) }, "Moods");
+    await ownBranch("moods").save({ "moods.json": JSON.stringify(result) }, "Moods");
   }
   const counts = {};
-  for (const m of list) counts[m] = (counts[m] || 0) + 1;
-  console.log("moods:", JSON.stringify(counts));
-  const todo = Object.keys(counts).filter((m) => !files[`music-${m}.mp3`]);
+  for (const seg of result.chapters.flat()) counts[seg.mood] = (counts[seg.mood] || 0) + 1;
+  console.log(`mood changes: ${result.chapters.flat().length - result.chapters.length}, moods:`, JSON.stringify(counts));
+  const todo = Object.keys(counts).flatMap((mood) => VARIANTS.filter((v) => !files[`music-${mood}-${v}.pcm`]).map((variant) => ({ mood, variant })));
   output("compose", JSON.stringify(todo));
 }
 
@@ -120,9 +125,16 @@ async function compose() {
     rate = model.config.audio_encoder.sampling_rate;
     samples = audio.data;
   }
-  const mp3 = toMp3(normalise(makeLoop(samples, rate)), rate);
-  console.log(`${mood}: ${(samples.length / rate).toFixed(0)} s of music in ${((performance.now() - started) / 1000).toFixed(0)} s`);
-  await ownBranch(`music-${mood}`).save({ [`music-${mood}.mp3`]: mp3 }, `Music: ${mood}`);
+  const variant = process.env.VARIANT || "a";
+  const loop = normalise(makeLoop(samples, rate));
+  const mp3 = toMp3(loop, rate);
+  // The same music at the narration's sample rate, ready to mix.
+  const pcm = Int16Array.from(resample(Float32Array.from(loop, (x) => x / 32768), rate, SAMPLE_RATE), (x) => Math.round(x * 32767));
+  console.log(`${mood} ${variant}: ${(samples.length / rate).toFixed(0)} s of music in ${((performance.now() - started) / 1000).toFixed(0)} s`);
+  await ownBranch(`music-${mood}-${variant}`).save(
+    { [`music-${mood}-${variant}.mp3`]: mp3, [`music-${mood}-${variant}.pcm`]: Buffer.from(pcm.buffer) },
+    `Music: ${mood} ${variant}`,
+  );
 }
 
 const mode = process.argv[2];

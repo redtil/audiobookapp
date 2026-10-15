@@ -70,26 +70,69 @@ export function moodFromProfile({ valence, arousal, emotion, groups }) {
   return groups.wonder > 0.3 ? "mysterious" : "reflective";
 }
 
-// Moods of a whole book: one per chapter, smoothed so a single odd chapter
-// doesn't flip the music when its neighbours agree.
-export async function bookMoods(book, classify) {
-  const moods = [];
-  const profiles = [];
-  for (const chapter of book.chapters) {
-    const sentences = chapter.paras.flat().filter((s) => s.trim().length > 3);
-    // A sample of up to 120 sentences spread through the chapter is plenty.
-    const step = Math.max(1, Math.floor(sentences.length / 120));
-    const sample = sentences.filter((_, i) => i % step === 0).slice(0, 120);
-    const scores = [];
-    for (let i = 0; i < sample.length; i += 16) {
-      scores.push(...(await classify(sample.slice(i, i + 16))));
+// How the mood moves through a chapter. Every sentence is read; each
+// sentence's mood comes from the sentences around it (a window of about a
+// paragraph either side), and the music only changes when a new mood holds
+// for a while, so it follows scenes rather than single lines.
+const WINDOW = 6; // sentences either side
+const HOLD = 8; // a new mood must last this many sentences
+const MIN_SEGMENT = 12; // and a segment at least this long
+
+export function chapterSegments(scores) {
+  if (!scores.length) return [{ at: 0, mood: "reflective", intensity: 1 }];
+  const local = scores.map((_, i) => {
+    const profile = chapterProfile(scores.slice(Math.max(0, i - WINDOW), i + WINDOW + 1));
+    return { mood: moodFromProfile(profile), arousal: profile.arousal, emotion: profile.emotion };
+  });
+  const segments = [{ at: 0, mood: local[0].mood }];
+  let run = null; // { mood, from, length } of a mood that might take over
+  for (let i = 1; i < local.length; i++) {
+    const current = segments[segments.length - 1];
+    const m = local[i].mood;
+    if (m === current.mood) {
+      run = null;
+      continue;
     }
-    const profile = chapterProfile(scores);
-    profiles.push(profile);
-    moods.push(sample.length ? moodFromProfile(profile) : "reflective");
+    run = run && run.mood === m ? { ...run, length: run.length + 1 } : { mood: m, from: i, length: 1 };
+    if (run.length >= HOLD && run.from - current.at >= MIN_SEGMENT) {
+      segments.push({ at: run.from, mood: m });
+      run = null;
+    }
   }
-  for (let i = 1; i < moods.length - 1; i++) {
-    if (moods[i - 1] === moods[i + 1] && moods[i] !== moods[i - 1] && profiles[i].emotion < 0.25) moods[i] = moods[i - 1];
+  // Louder in intense passages, softer in quiet ones.
+  segments.forEach((seg, k) => {
+    const end = segments[k + 1]?.at ?? local.length;
+    const part = local.slice(seg.at, end);
+    const arousal = part.reduce((n, x) => n + x.arousal, 0) / part.length;
+    const emotion = part.reduce((n, x) => n + x.emotion, 0) / part.length;
+    seg.intensity = +Math.min(1.3, Math.max(0.7, 0.85 + 0.5 * arousal * Math.min(1, emotion * 2))).toFixed(2);
+  });
+  return segments;
+}
+
+// The whole book: { chapters: [[{ at: sentence, mood, intensity }]], moods:
+// [the main mood of each chapter] }.
+export async function bookMoods(book, classify) {
+  const chapters = [];
+  const moods = [];
+  for (const chapter of book.chapters) {
+    const sentences = chapter.paras.flat();
+    const scores = [];
+    for (let i = 0; i < sentences.length; i += 32) {
+      const batch = sentences.slice(i, i + 32);
+      const real = batch.map((t, k) => (t.trim().length > 3 ? k : -1)).filter((k) => k >= 0);
+      const out = real.length ? await classify(real.map((k) => batch[k])) : [];
+      const byIndex = new Map(real.map((k, j) => [k, out[j]]));
+      batch.forEach((_, k) => scores.push(byIndex.get(k) || [{ label: "neutral", score: 1 }]));
+    }
+    const segments = chapterSegments(scores);
+    chapters.push(segments);
+    // Main mood: the one covering the most sentences.
+    const cover = {};
+    segments.forEach((seg, k) => {
+      cover[seg.mood] = (cover[seg.mood] || 0) + ((segments[k + 1]?.at ?? sentences.length) - seg.at);
+    });
+    moods.push(Object.entries(cover).sort((x, y) => y[1] - x[1])[0][0]);
   }
-  return moods;
+  return { chapters, moods };
 }

@@ -30,6 +30,7 @@ export class Player {
     this.nextTrack = null;
     this.sentence = -1;
     this.rate = 1;
+    this.withMusic = false; // play the versions mixed with music, where there are any
     audio.addEventListener("timeupdate", () => this.tick());
     audio.addEventListener("seeked", () => this.tick());
     audio.addEventListener("play", () => this.on.onState?.(true));
@@ -60,9 +61,46 @@ export class Player {
   async build(ch) {
     const ids = this.index[ch];
     if (!ids) throw new Error("This chapter's audio is missing.");
-    const [mp3, json] = await Promise.all([cached(ids.mp3, this.fetchBlob), cached(ids.json, this.fetchBlob)]);
+    const mixed = this.withMusic && !!ids.mix;
+    const [mp3, json] = await Promise.all([cached(mixed ? ids.mix : ids.mp3, this.fetchBlob), cached(ids.json, this.fetchBlob)]);
     const { starts, duration } = JSON.parse(await json.text());
-    return { ch, url: URL.createObjectURL(new Blob([mp3], { type: "audio/mpeg" })), starts, duration };
+    return { ch, mixed, url: URL.createObjectURL(new Blob([mp3], { type: "audio/mpeg" })), starts, duration };
+  }
+
+  // Swap the chapter that's playing for the other version (with or without
+  // music), carrying on from the same moment.
+  async swapCurrent() {
+    if (!this.track) return;
+    const { ch } = this.track;
+    const at = this.audio.currentTime;
+    const wasPlaying = this.playing;
+    if (this.nextTrack) URL.revokeObjectURL(this.nextTrack.url);
+    this.nextTrack = null;
+    const t = await this.build(ch);
+    if (this.track?.ch !== ch) return URL.revokeObjectURL(t.url);
+    URL.revokeObjectURL(this.track.url);
+    this.track = t;
+    this.audio.src = t.url;
+    await new Promise((r) => this.audio.addEventListener("loadedmetadata", r, { once: true }));
+    this.audio.playbackRate = this.rate;
+    this.audio.currentTime = at;
+    if (wasPlaying) await this.play();
+  }
+
+  async setWithMusic(on) {
+    this.withMusic = on;
+    const wants = on && !!this.index?.[this.track?.ch]?.mix;
+    if (this.track && this.track.mixed !== wants) await this.swapCurrent();
+  }
+
+  // New audio arrived (e.g. chapters mixed with music since the book opened).
+  updateIndex(index) {
+    this.index = index;
+    if (this.nextTrack && this.nextTrack.mixed !== (this.withMusic && !!index[this.nextTrack.ch]?.mix)) {
+      URL.revokeObjectURL(this.nextTrack.url);
+      this.nextTrack = null;
+    }
+    if (this.track && this.withMusic && index[this.track.ch]?.mix && !this.track.mixed) this.swapCurrent();
   }
 
   async loadChapter(ch, sentence = 0, { autoplay = false } = {}) {

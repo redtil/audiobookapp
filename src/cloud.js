@@ -114,7 +114,7 @@ export class Library {
   // ---------- audio ----------
 
   // Everything made for a book so far:
-  //   chapters: { [chapter]: { mp3: sha, json: sha } }
+  //   chapters: { [chapter]: { mp3: sha, json: sha, mix: sha (with music) } }
   //   moods: sha of moods.json, music: { [mood]: sha of its MP3 }
   async audioAll(id) {
     const refs = (await this.call(`/repos/${this.dataRepo}/git/matching-refs/heads/audio/${id}/`)) || [];
@@ -126,7 +126,8 @@ export class Library {
       for (const f of tree.tree) {
         let m;
         if ((m = f.path.match(/^(\d+)\.(mp3|json)$/))) (chapters[+m[1]] ??= {})[m[2]] = f.sha;
-        else if ((m = f.path.match(/^music-(\w+)\.mp3$/))) music[m[1]] = f.sha;
+        else if ((m = f.path.match(/^(\d+)\.mix\.mp3$/))) (chapters[+m[1]] ??= {}).mix = f.sha;
+        else if ((m = f.path.match(/^music-([a-z]+)(?:-([a-z]))?\.mp3$/))) music[m[1]] ??= f.sha;
         else if (f.path === "moods.json") moods = f.sha;
       }
     }
