@@ -9,7 +9,17 @@
 // a little louder in intense passages and softer in quiet ones.
 
 const FADE = 3; // seconds of crossfade between moods
-const UNDER_VOICE = 0.2; // music level while speaking, relative to the voice (about -14 dB)
+// Music level while speaking, relative to the voice. Each level is its own
+// file, so the listener can choose and it still plays on a locked phone.
+export const LEVELS = {
+  faint: 0.063, // about -24 dB
+  soft: 0.11, // about -19 dB
+  medium: 0.2, // about -14 dB
+  strong: 0.36, // about -9 dB
+  full: 0.56, // about -5 dB
+};
+// medium is saved as 0007.mix.mp3, the others as 0007.mix-soft.mp3 etc.
+export const levelFile = (name, level) => (level === "medium" ? `${name}.mix.mp3` : `${name}.mix-${level}.mp3`);
 const DUCK = 0.45; // how far the music dips while the narrator speaks (about -7 dB)
 const ATTACK = 0.08; // seconds for the music to dip when speech starts
 const RELEASE = 0.4; // and to come back up in a pause
@@ -26,14 +36,15 @@ function rms(samples) {
 
 // voice: Int16Array; starts: seconds per sentence; segments: [{ at, mood,
 // intensity }]; clips: { mood: [Int16Array, ...] } at the same rate.
-export function mixChapter(voice, starts, segments, clips, rate) {
+// Returns { level: Int16Array } for each level asked for.
+export function mixChapter(voice, starts, segments, clips, rate, levels = ["medium"]) {
   const n = voice.length;
   const v = new Float32Array(n);
   for (let i = 0; i < n; i++) v[i] = voice[i] / 32768;
 
   const clipLevel = rms(Object.values(clips).flat()[0] || new Int16Array(1)) / 32768 || 0.08;
   const voiceLevel = rms(v) || 0.1;
-  const base = (UNDER_VOICE * voiceLevel) / (clipLevel * DUCK);
+  const base = voiceLevel / (clipLevel * DUCK); // scaled by each level below
 
   // The music bed, segment by segment, each fading into the next.
   const bed = new Float32Array(n);
@@ -65,7 +76,6 @@ export function mixChapter(voice, starts, segments, clips, rate) {
   const up = 1 - Math.exp(-1 / (ATTACK * 100));
   const down = 1 - Math.exp(-1 / (RELEASE * 100));
   let level = 1;
-  const out = new Int16Array(n);
   for (let b = 0; b * block < n; b++) {
     const s = b * block;
     const e = Math.min(n, s + block);
@@ -75,11 +85,18 @@ export function mixChapter(voice, starts, segments, clips, rate) {
     const target = speaking ? DUCK : 1;
     const startLevel = level;
     level += (target - level) * (target < level ? up : down);
-    for (let i = s; i < e; i++) {
-      const g = startLevel + ((level - startLevel) * (i - s)) / (e - s);
-      const x = v[i] + bed[i] * g;
-      out[i] = Math.round((Math.abs(x) > 0.9 ? Math.sign(x) * (0.9 + 0.1 * Math.tanh((Math.abs(x) - 0.9) * 10)) : x) * 32767);
+    for (let i = s; i < e; i++) bed[i] *= startLevel + ((level - startLevel) * (i - s)) / (e - s);
+  }
+
+  const out = {};
+  for (const name of levels) {
+    const under = LEVELS[name];
+    const pcm = new Int16Array(n);
+    for (let i = 0; i < n; i++) {
+      const x = v[i] + bed[i] * under;
+      pcm[i] = Math.round((Math.abs(x) > 0.9 ? Math.sign(x) * (0.9 + 0.1 * Math.tanh((Math.abs(x) - 0.9) * 10)) : x) * 32767);
     }
+    out[name] = pcm;
   }
   return out;
 }

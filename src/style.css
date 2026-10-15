@@ -293,3 +293,9 @@ h1, h2 { margin: 0; }
   .controls { gap: 4px; }
   .speed { width: 64px; }
 }
+
+#musicLevelName { color: var(--text); }
+.ticks { display: flex; justify-content: space-between; font-size: 0.72rem; color: var(--muted); padding: 0 2px; }
+.ticks i { font-style: normal; width: 0; display: flex; justify-content: center; white-space: nowrap; }
+.ticks i:first-child { justify-content: flex-start; }
+.ticks i:last-child { justify-content: flex-end; }

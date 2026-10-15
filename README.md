@@ -17,11 +17,12 @@ Everything runs on GitHub, for free:
   - `audio/<id>/<part>` branches: one MP3 per chapter, plus the start time of each sentence
 - **Preparing** runs the [Kokoro](https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX) voice model on GitHub Actions (`.github/workflows/prepare.yml`, `server/`). A book's chapters are split across up to 20 machines at once. Each machine makes audio about 2× faster than real time, so a 10-hour book takes roughly 20–30 minutes. Actions minutes are free for public repositories. The book's text and audio only ever live in the private library; the logs here show chapter numbers and timings, never titles or text.
 
-**Background music** (♫ in the player) follows the mood of each chapter:
+**Background music** follows the story as it's read, and is mixed into the narration so it plays wherever the voice does:
 
-- While a book is prepared, the server reads every chapter with an emotion model ([GoEmotions](https://huggingface.co/Cohee/distilbert-base-uncased-go-emotions-onnx), MIT), places it on the valence/arousal map music psychology uses, and picks one of nine moods: calm, reflective, melancholy, uplifting, tender, mysterious, suspense, dark, epic (`server/moods.mjs`).
-- For each mood the book has, [MusicGen](https://huggingface.co/Xenova/musicgen-small) composes a 30-second piece on its own machine, made to loop seamlessly (`server/music.mjs`). MusicGen's weights are CC BY-NC 4.0: fine for personal listening, not for selling the music.
-- Until (or unless) a book has composed music, the app composes ambient music live in the browser with the Web Audio API (`src/music.js`), with moods guessed from the chapter's words (`src/mood.js`). Books prepared before music existed get a "Compose music for this book" button.
+- The server reads every sentence with an emotion model ([GoEmotions](https://huggingface.co/Cohee/distilbert-base-uncased-go-emotions-onnx), MIT), places it on the valence/arousal map music psychology uses, and marks where the mood changes: calm, reflective, melancholy, uplifting, tender, mysterious, suspense, dark or epic. A new mood has to hold for a few sentences, so the music follows scenes (`server/moods.mjs`).
+- For each mood the book has, [MusicGen](https://huggingface.co/Xenova/musicgen-small) composes two 30-second pieces, made to loop seamlessly (`server/music.mjs`). MusicGen's weights are CC BY-NC 4.0: fine for personal listening, not for selling the music.
+- Each chapter is then mixed (`server/mix.mjs`): the mood's music under the voice, dipping while the narrator speaks, rising in pauses and crossfading at mood changes, at five levels the listener picks from (Faint, Soft, Medium, Strong, Full; about 24 to 5 dB under the voice). Each level is its own file next to the plain narration.
+- Books without server music get ambient music composed live in the browser (`src/music.js`).
 
 The app talks to both repositories with one fine-grained access token, the "library key".
 

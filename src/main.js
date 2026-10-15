@@ -12,7 +12,18 @@ const $ = (id) => document.getElementById(id);
 const el = new Proxy({}, { get: (_, id) => $(id) });
 
 const CHARS_PER_SECOND = 15; // speaking rate at 1×, for estimates
-const settings = { voice: "af_heart", speed: 1, music: false, musicVolume: 0.45, ...db.loadSettings() };
+const settings = { voice: "af_heart", speed: 1, musicLevel: "off", ...db.loadSettings() };
+// Earlier versions had an on/off switch.
+if (settings.music !== undefined) {
+  if (settings.musicLevel === "off" && settings.music) settings.musicLevel = "medium";
+  delete settings.music;
+  delete settings.musicVolume;
+}
+const musicOn = () => settings.musicLevel !== "off";
+const LEVEL_ORDER = ["off", "faint", "soft", "medium", "strong", "full"];
+const LEVEL_NAMES = { off: "Off", faint: "Faint", soft: "Soft", medium: "Medium", strong: "Strong", full: "Full" };
+// Loudness of the live composer at each level.
+const LIVE_VOLUME = { faint: 0.2, soft: 0.33, medium: 0.5, strong: 0.72, full: 0.95 };
 const save = () => db.saveSettings(settings);
 
 let cloud = null; // Library, once connected
@@ -399,7 +410,7 @@ async function openPlayer() {
       db.putBook(book);
     }
     const pos = e.pos || { ch: 0, i: 0 };
-    player.withMusic = settings.music;
+    player.musicLevel = musicOn() ? settings.musicLevel : null;
     await player.open(book, book.index, (sha) => cloud.blob(sha), Math.min(pos.ch, book.chapters.length - 1), pos.i);
     updateMetadata();
     music.clearClips();
@@ -618,7 +629,7 @@ el.redoBtn.addEventListener("click", startOver);
 // ---------- listening ----------
 
 const music = new MusicEngine();
-music.setVolume(settings.musicVolume);
+music.setVolume(LIVE_VOLUME[settings.musicLevel] ?? 0.5);
 
 // The mood at a sentence: from the server's reading of the book when it has
 // one (it changes within chapters as the story does), otherwise a quick guess
@@ -638,19 +649,28 @@ function moodAt(ch, i = 0) {
 const mixedHere = () => !!player.track?.mixed;
 
 function syncMusic() {
-  el.musicBtn.classList.toggle("on", settings.music);
+  el.musicBtn.classList.toggle("on", musicOn());
+  el.musicLevel.value = LEVEL_ORDER.indexOf(settings.musicLevel);
+  el.musicLevelName.textContent = LEVEL_NAMES[settings.musicLevel];
   // The live composer only fills in where the narration has no music of its own.
-  const live = settings.music && player.playing && !mixedHere();
+  const live = musicOn() && player.playing && !mixedHere();
   const mood = moodAt(shownCh, Math.max(0, player.sentence));
   if (live) music.play(mood);
   else music.pause();
   const label = MOODS[mood]?.label || "";
-  el.musicNow.textContent = !settings.music ? ""
-    : mixedHere() ? `Now: ${label}. The music is part of the narration and follows the story.`
-    : `Now: ${label}, composed live on this device.`;
-  el.musicVolRow.hidden = mixedHere();
-  const hasMix = Object.values(book?.index || {}).some((c) => c.mix);
-  el.composeBtn.hidden = !book || hasMix || composing.has(book.id);
+  const wanted = settings.musicLevel;
+  const playing = player.track?.mixed;
+  el.musicNow.textContent = !musicOn() ? "Narration only."
+    : !mixedHere() ? `Now: ${label}, composed live on this device.`
+    : playing === wanted ? `Now: ${label}. The music is part of the narration and follows the story.`
+    : `Now: ${label}. This book has the music at ${LEVEL_NAMES[playing]} only so far.`;
+  // Offer to make what's missing: music at all, or the chosen level.
+  const chapters = Object.values(book?.index || {});
+  const hasMix = chapters.some((c) => c.mix);
+  const hasLevel = chapters.some((c) => c.mix?.[wanted]);
+  const offer = !!book && musicOn() && !composing.has(book.id) && (!hasMix || !hasLevel);
+  el.composeBtn.hidden = !offer;
+  el.composeBtn.textContent = hasMix ? `Make the ${LEVEL_NAMES[wanted]} level for this book` : "Add music to this book";
 }
 
 // What the server made for this book: mood segments, composed music, and
@@ -698,7 +718,7 @@ const player = new Player(el.audio, {
   onSentence: (ch, i) => {
     if (!book) return;
     markSentence(i);
-    if (settings.music && !mixedHere()) {
+    if (musicOn() && !mixedHere()) {
       music.setMood(moodAt(ch, i));
       el.musicNow.textContent = `Now: ${MOODS[moodAt(ch, i)]?.label || ""}, composed live on this device.`;
     }
@@ -766,7 +786,7 @@ if ("mediaSession" in navigator) {
 
 el.playBtn.addEventListener("click", () => {
   if (player.playing) return player.pause();
-  if (settings.music) music.ensure(); // sound can only start from a tap
+  if (musicOn()) music.ensure(); // sound can only start from a tap
   player.play().catch((err) => playerStatus(err.message));
 });
 el.prevBtn.addEventListener("click", () => player.goToSentence(shownCh, player.sentence - 1));
@@ -774,15 +794,22 @@ el.nextBtn.addEventListener("click", () => player.goToSentence(shownCh, player.s
 el.musicBtn.addEventListener("click", () => {
   el.musicMenu.hidden = !el.musicMenu.hidden;
   el.moreMenu.hidden = true;
-  el.musicOn.checked = settings.music;
-  el.musicVol.value = Math.round(settings.musicVolume * 100);
   syncMusic();
 });
-el.musicOn.addEventListener("change", async () => {
-  settings.music = el.musicOn.checked;
+el.musicLevel.addEventListener("input", () => {
+  el.musicLevelName.textContent = LEVEL_NAMES[LEVEL_ORDER[el.musicLevel.value]];
+});
+el.musicLevel.addEventListener("change", async () => {
+  const level = LEVEL_ORDER[el.musicLevel.value];
+  if (!level || level === settings.musicLevel) return;
+  settings.musicLevel = level;
   save();
-  if (settings.music) music.ensure();
-  await player.setWithMusic(settings.music);
+  if (musicOn()) {
+    music.ensure();
+    music.setVolume(LIVE_VOLUME[level]);
+  }
+  syncMusic();
+  await player.setMusicLevel(musicOn() ? level : null);
   syncMusic();
 });
 el.composeBtn.addEventListener("click", async () => {
@@ -792,7 +819,7 @@ el.composeBtn.addEventListener("click", async () => {
     // Preparing again only does what's missing: here, the moods and music.
     await cloud.startPreparing(id, entry(id).voice || settings.voice);
     composing.add(id);
-    el.composeInfo.textContent = "Adding music on the server: about 10 to 20 minutes. It switches on by itself next time you open the book.";
+    el.composeInfo.textContent = "Making it on the server: about 10 to 20 minutes. It's used by itself next time you open the book.";
   } catch (err) {
     el.composeInfo.textContent = err.message;
   } finally {
@@ -802,11 +829,7 @@ el.composeBtn.addEventListener("click", async () => {
   }
 });
 
-el.musicVol.addEventListener("input", () => {
-  settings.musicVolume = el.musicVol.value / 100;
-  music.setVolume(settings.musicVolume);
-  save();
-});
+
 
 el.moreBtn.addEventListener("click", () => {
   el.musicMenu.hidden = true;

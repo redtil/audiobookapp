@@ -148,13 +148,10 @@
           <button id="moreBtn" class="icon-btn big" aria-label="More">⋯</button>
         </div>
         <div id="musicMenu" class="more" hidden>
-          <label class="switch-row">
-            <input id="musicOn" type="checkbox" />
-            <span>Background music that follows the mood of the book</span>
-          </label>
-          <label id="musicVolRow" class="field slider">
-            <span>Music volume</span>
-            <input id="musicVol" type="range" min="0" max="100" value="45" />
+          <label class="field slider" for="musicLevel">
+            <span>Background music: <strong id="musicLevelName">Off</strong></span>
+            <input id="musicLevel" type="range" min="0" max="5" step="1" value="0" list="musicTicks" />
+            <span class="ticks" aria-hidden="true"><i>Off</i><i>Faint</i><i>Soft</i><i>Medium</i><i>Strong</i><i>Full</i></span>
           </label>
           <p id="musicNow" class="muted small"></p>
           <button id="composeBtn" class="btn" hidden>Add music to this book</button>

@@ -30,7 +30,7 @@ export class Player {
     this.nextTrack = null;
     this.sentence = -1;
     this.rate = 1;
-    this.withMusic = false; // play the versions mixed with music, where there are any
+    this.musicLevel = null; // "faint" … "full": play the version mixed with music at that level
     audio.addEventListener("timeupdate", () => this.tick());
     audio.addEventListener("seeked", () => this.tick());
     audio.addEventListener("play", () => this.on.onState?.(true));
@@ -61,8 +61,8 @@ export class Player {
   async build(ch) {
     const ids = this.index[ch];
     if (!ids) throw new Error("This chapter's audio is missing.");
-    const mixed = this.withMusic && !!ids.mix;
-    const [mp3, json] = await Promise.all([cached(mixed ? ids.mix : ids.mp3, this.fetchBlob), cached(ids.json, this.fetchBlob)]);
+    const mixed = this.levelFor(ids);
+    const [mp3, json] = await Promise.all([cached(mixed ? ids.mix[mixed] : ids.mp3, this.fetchBlob), cached(ids.json, this.fetchBlob)]);
     const { starts, duration } = JSON.parse(await json.text());
     return { ch, mixed, url: URL.createObjectURL(new Blob([mp3], { type: "audio/mpeg" })), starts, duration };
   }
@@ -87,20 +87,34 @@ export class Player {
     if (wasPlaying) await this.play();
   }
 
-  async setWithMusic(on) {
-    this.withMusic = on;
-    const wants = on && !!this.index?.[this.track?.ch]?.mix;
-    if (this.track && this.track.mixed !== wants) await this.swapCurrent();
+  // The music level this chapter can play: the one chosen, or the nearest
+  // the chapter has (books mixed before levels existed have only medium).
+  levelFor(ids) {
+    if (!this.musicLevel || !ids?.mix) return null;
+    const order = ["faint", "soft", "medium", "strong", "full"];
+    const want = order.indexOf(this.musicLevel);
+    const have = order.filter((l) => ids.mix[l]);
+    // The chosen level, or the closest one this chapter has.
+    return have.sort((a, b) => Math.abs(order.indexOf(a) - want) - Math.abs(order.indexOf(b) - want))[0] || null;
+  }
+
+  async setMusicLevel(level) {
+    this.musicLevel = level;
+    if (this.nextTrack) {
+      URL.revokeObjectURL(this.nextTrack.url);
+      this.nextTrack = null;
+    }
+    if (this.track && this.track.mixed !== this.levelFor(this.index?.[this.track.ch])) await this.swapCurrent();
   }
 
   // New audio arrived (e.g. chapters mixed with music since the book opened).
   updateIndex(index) {
     this.index = index;
-    if (this.nextTrack && this.nextTrack.mixed !== (this.withMusic && !!index[this.nextTrack.ch]?.mix)) {
+    if (this.nextTrack && this.nextTrack.mixed !== this.levelFor(index[this.nextTrack.ch])) {
       URL.revokeObjectURL(this.nextTrack.url);
       this.nextTrack = null;
     }
-    if (this.track && this.withMusic && index[this.track.ch]?.mix && !this.track.mixed) this.swapCurrent();
+    if (this.track && this.track.mixed !== this.levelFor(index[this.track.ch])) this.swapCurrent();
   }
 
   async loadChapter(ch, sentence = 0, { autoplay = false } = {}) {

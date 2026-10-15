@@ -16,20 +16,22 @@
 import { loadVoice, trimSilence, encodeMp3, toInt16, SAMPLE_RATE } from "./voice.mjs";
 import { planParts } from "../src/plan.js";
 import { readBook, audioFiles, readBlob, ownBranch, output } from "./library.mjs";
-import { mixChapter } from "./mix.mjs";
+import { mixChapter, LEVELS, levelFile } from "./mix.mjs";
 
 const { BOOK, VOICE = "af_heart" } = process.env;
 const MUSIC = process.env.MUSIC === "yes";
 const PAUSE = { sentence: 0.28, paragraph: 0.65, chapter: 1.5 };
 const CHARS_PER_PART = +process.env.CHARS_PER_PART || undefined;
 
-// Chapters that already have narration (or, with mixed = true, the version
-// mixed with music), from every machine's branch.
+// Chapters that already have narration (or, with mixed = true, every music
+// level mixed in), from every machine's branch.
 function chaptersWith(files, mixed = false) {
   const done = new Set();
   for (const name of Object.keys(files)) {
-    const m = name.match(mixed ? /^(\d+)\.mix\.mp3$/ : /^(\d+)\.json$/);
-    if (m) done.add(+m[1]);
+    const m = name.match(/^(\d+)\.json$/);
+    if (!m) continue;
+    const base = name.slice(0, -5);
+    if (!mixed || Object.keys(LEVELS).every((l) => files[levelFile(base, l)])) done.add(+m[1]);
   }
   return done;
 }
@@ -48,10 +50,10 @@ async function plan() {
   console.log(`${book.chapters.length} chapters, ${voiced.size} done, ${todo.length} to make on ${parts.length} machines`);
   output("parts", JSON.stringify(parts));
   output("count", parts.length);
-  // Mixing is quick: a few machines are plenty.
+  // Mixing is quick; saving three levels as MP3 is most of the work, so share it over up to 8 machines.
   const mixed = chaptersWith(files, true);
   const toMix = MUSIC ? all.filter((ch) => !mixed.has(ch)) : [];
-  const mixParts = (toMix.length ? planParts(sizes, toMix, Math.ceil(sizes.reduce((a, b) => a + b, 0) / 4)) : [])
+  const mixParts = (toMix.length ? planParts(sizes, toMix, Math.ceil(sizes.reduce((a, b) => a + b, 0) / 8)) : [])
     .map((p, k) => ({ part: k, chapters: p.chapters.sort((a, b) => a - b).join(",") }));
   output("mixparts", JSON.stringify(mixParts));
 }
@@ -134,6 +136,8 @@ async function mix() {
       console.log(`chapter ${ch}: no narration yet, skipped`);
       continue;
     }
+    const levels = Object.keys(LEVELS).filter((l) => !files[levelFile(name, l)]);
+    if (!levels.length) continue;
     const started = performance.now();
     const timing = JSON.parse(await readBlob(files[`${name}.json`]));
     const decoded = decoder.decode(new Uint8Array(await readBlob(files[`${name}.mp3`])));
@@ -148,9 +152,10 @@ async function mix() {
       console.log(`chapter ${ch}: its music isn't composed, skipped`);
       continue;
     }
-    const mixed = mixChapter(toInt16(samples), timing.starts, segments, songs, SAMPLE_RATE);
-    await branch.save({ [`${name}.mix.mp3`]: encodeMp3([mixed]) }, `Chapter ${ch} with music`);
-    console.log(`chapter ${ch}: ${segments.length} music segment(s), mixed in ${((performance.now() - started) / 1000).toFixed(1)} s`);
+    const mixed = mixChapter(toInt16(samples), timing.starts, segments, songs, SAMPLE_RATE, levels);
+    const out = Object.fromEntries(levels.map((l) => [levelFile(name, l), encodeMp3([mixed[l]])]));
+    await branch.save(out, `Chapter ${ch} with music (${levels.join(", ")})`);
+    console.log(`chapter ${ch}: ${segments.length} music segment(s), ${levels.join("/")} mixed in ${((performance.now() - started) / 1000).toFixed(1)} s`);
   }
 }
 
