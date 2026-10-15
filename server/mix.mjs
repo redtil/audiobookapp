@@ -5,8 +5,11 @@
 // sentence start times turn that into time. Each segment loops its mood's
 // composed music (alternating between versions so it doesn't repeat
 // exactly), crossfading into the next mood. The music sits under the voice:
-// it dips while the narrator speaks and comes back up in the pauses, and it's
-// a little louder in intense passages and softer in quiet ones.
+// it eases down while the narrator speaks and stays down through a passage,
+// rising slowly only in real pauses (between paragraphs), so it never pumps
+// around the words. It's a little louder in intense passages and softer in
+// quiet ones. The voice itself is never changed: where they'd clip together,
+// the music gives way.
 
 const FADE = 3; // seconds of crossfade between moods
 // Music level while speaking, relative to the voice. Each level is its own
@@ -20,9 +23,12 @@ export const LEVELS = {
 };
 // medium is saved as 0007.mix.mp3, the others as 0007.mix-soft.mp3 etc.
 export const levelFile = (name, level) => (level === "medium" ? `${name}.mix.mp3` : `${name}.mix-${level}.mp3`);
-const DUCK = 0.45; // how far the music dips while the narrator speaks (about -7 dB)
-const ATTACK = 0.08; // seconds for the music to dip when speech starts
-const RELEASE = 0.4; // and to come back up in a pause
+// Increase when the mix changes, so books mixed before get mixed again.
+export const MIX_VERSION = 2;
+const DUCK = 0.6; // how far the music eases down while the narrator speaks (about -4 dB)
+const ATTACK = 0.3; // seconds for it to ease down when speech starts
+const HOLD = 0.7; // it stays down through gaps shorter than this (between words and sentences)
+const RELEASE = 1.5; // then comes back up this slowly
 
 function rms(samples) {
   let sum = 0;
@@ -70,19 +76,20 @@ export function mixChapter(voice, starts, segments, clips, rate, levels = ["medi
     }
   });
 
-  // Duck under the voice, following its loudness in 10 ms steps.
+  // Ease under the voice, following its loudness in 10 ms steps.
   const block = Math.round(rate / 100);
   const threshold = voiceLevel * 0.25;
   const up = 1 - Math.exp(-1 / (ATTACK * 100));
   const down = 1 - Math.exp(-1 / (RELEASE * 100));
-  let level = 1;
+  let level = DUCK;
+  let quietFor = 0; // seconds since the voice last spoke
   for (let b = 0; b * block < n; b++) {
     const s = b * block;
     const e = Math.min(n, s + block);
     let sum = 0;
     for (let i = s; i < e; i++) sum += v[i] * v[i];
-    const speaking = Math.sqrt(sum / (e - s)) > threshold;
-    const target = speaking ? DUCK : 1;
+    quietFor = Math.sqrt(sum / (e - s)) > threshold ? 0 : quietFor + 0.01;
+    const target = quietFor < HOLD ? DUCK : 1;
     const startLevel = level;
     level += (target - level) * (target < level ? up : down);
     for (let i = s; i < e; i++) bed[i] *= startLevel + ((level - startLevel) * (i - s)) / (e - s);
@@ -93,8 +100,11 @@ export function mixChapter(voice, starts, segments, clips, rate, levels = ["medi
     const under = LEVELS[name];
     const pcm = new Int16Array(n);
     for (let i = 0; i < n; i++) {
-      const x = v[i] + bed[i] * under;
-      pcm[i] = Math.round((Math.abs(x) > 0.9 ? Math.sign(x) * (0.9 + 0.1 * Math.tanh((Math.abs(x) - 0.9) * 10)) : x) * 32767);
+      let m = bed[i] * under;
+      // Room for the music without touching the voice.
+      const room = Math.max(0, 0.97 - Math.abs(v[i]));
+      if (Math.abs(v[i] + m) > 0.97) m = Math.sign(m) * Math.min(Math.abs(m), room);
+      pcm[i] = Math.round((v[i] + m) * 32767);
     }
     out[name] = pcm;
   }

@@ -6,6 +6,8 @@
 // The rest of the app only sees books, chapters and statuses.
 
 const API = "https://api.github.com";
+// Keep in step with MIX_VERSION in server/mix.mjs.
+const MIX_VERSION = 2;
 
 export class Library {
   constructor({ key, appRepo, dataRepo }) {
@@ -122,8 +124,11 @@ export class Library {
     const chapters = {};
     const music = {};
     let moods = null;
+    let oldMix = false; // mixed before the current way of mixing (see server/mix.mjs)
     const trees = await Promise.all(refs.map((r) => this.call(`/repos/${this.dataRepo}/git/trees/${r.object.sha}`)));
     for (const tree of trees) {
+      const names = tree.tree.map((f) => f.path);
+      if (names.some((n) => /\.mix(-\w+)?\.mp3$/.test(n)) && !names.includes(`mix-v${MIX_VERSION}.json`)) oldMix = true;
       for (const f of tree.tree) {
         let m;
         if ((m = f.path.match(/^(\d+)\.(mp3|json)$/))) (chapters[+m[1]] ??= {})[m[2]] = f.sha;
@@ -133,7 +138,7 @@ export class Library {
       }
     }
     for (const ch of Object.keys(chapters)) if (!chapters[ch].mp3 || !chapters[ch].json) delete chapters[ch];
-    return { chapters, moods, music };
+    return { chapters, moods, music, oldMix };
   }
 
   // { [chapter]: { mp3: sha, json: sha } } for every chapter made so far.

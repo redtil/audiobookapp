@@ -44,6 +44,19 @@ export async function audioFiles() {
   return files;
 }
 
+// This book's audio branches, each with the names of its files.
+export async function audioBranches() {
+  const refs = (await api(`/repos/${DATA_REPO}/git/matching-refs/heads/audio/${BOOK}/`)) || [];
+  return Promise.all(refs.map(async (ref) => ({
+    ref: ref.ref,
+    files: ((await api(`/repos/${DATA_REPO}/git/trees/${ref.object.sha}`))?.tree || []).map((f) => f.path),
+  })));
+}
+
+export async function deleteBranch(ref) {
+  await api(`/repos/${DATA_REPO}/git/${ref}`, { method: "DELETE" });
+}
+
 export async function readBlob(sha) {
   const res = await api(`/repos/${DATA_REPO}/git/blobs/${sha}`, { raw: true });
   return Buffer.from(await res.arrayBuffer());

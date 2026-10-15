@@ -702,9 +702,11 @@ function syncMusic() {
   const chapters = Object.values(book?.index || {});
   const hasMix = chapters.some((c) => c.mix);
   const hasLevel = chapters.some((c) => c.mix?.[wanted]);
-  const offer = !!book && musicOn() && !composing.has(book.id) && (!hasMix || !hasLevel);
+  const offer = !!book && musicOn() && !composing.has(book.id) && (!hasMix || !hasLevel || book.oldMix);
   el.composeBtn.hidden = !offer;
-  el.composeBtn.textContent = hasMix ? `Make the ${LEVEL_NAMES[wanted]} level for this book` : "Add music to this book";
+  el.composeBtn.textContent = !hasMix ? "Add music to this book"
+    : book.oldMix ? "Update the music mix (smoother narration)"
+    : `Make the ${LEVEL_NAMES[wanted]} level for this book`;
 }
 
 // What the server made for this book: mood segments, composed music, and
@@ -720,6 +722,7 @@ async function loadBookMusic(myBook) {
       myBook.moods = moods.moods;
       myBook.segments = moods.chapters;
     }
+    myBook.oldMix = all.oldMix;
     // Newly mixed chapters.
     const before = JSON.stringify(myBook.index);
     myBook.index = all.chapters;

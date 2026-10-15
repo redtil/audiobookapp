@@ -15,11 +15,13 @@
 
 import { loadVoice, trimSilence, encodeMp3, toInt16, SAMPLE_RATE } from "./voice.mjs";
 import { planParts } from "../src/plan.js";
-import { readBook, audioFiles, readBlob, ownBranch, output } from "./library.mjs";
-import { mixChapter, LEVELS, levelFile } from "./mix.mjs";
+import { readBook, audioFiles, audioBranches, deleteBranch, readBlob, ownBranch, output } from "./library.mjs";
+import { mixChapter, LEVELS, levelFile, MIX_VERSION } from "./mix.mjs";
 
 const { BOOK, VOICE = "af_heart" } = process.env;
 const MUSIC = process.env.MUSIC === "yes";
+const KBPS = 64; // narration and mixes: clear speech, even with music under it
+const MIX_MARK = `mix-v${MIX_VERSION}.json`; // saved with each mix, to tell old mixes from new
 const PAUSE = { sentence: 0.28, paragraph: 0.65, chapter: 1.5 };
 const CHARS_PER_PART = +process.env.CHARS_PER_PART || undefined;
 
@@ -40,6 +42,15 @@ const chapterChars = (c) => c.paras.reduce((n, p) => n + p.reduce((m, s) => m + 
 
 async function plan() {
   const book = await readBook();
+  // Mixes made the old way are dropped, so they're made again the new way.
+  if (MUSIC) {
+    for (const b of await audioBranches()) {
+      if (b.files.some((f) => /\.mix(-\w+)?\.mp3$/.test(f)) && !b.files.includes(MIX_MARK)) {
+        console.log("replacing an older music mix");
+        await deleteBranch(b.ref);
+      }
+    }
+  }
   const files = await audioFiles();
   const sizes = book.chapters.map(chapterChars);
   const all = book.chapters.map((_, ch) => ch);
@@ -88,7 +99,7 @@ async function makeChapter(speak, chapter, ch) {
     pcm.set(c, at);
     at += c.length;
   }
-  return { mp3: encodeMp3([pcm]), pcm, timing: { starts, duration: +(pos / SAMPLE_RATE).toFixed(3), voice: VOICE }, failures };
+  return { mp3: encodeMp3([pcm], KBPS), pcm, timing: { starts, duration: +(pos / SAMPLE_RATE).toFixed(3), voice: VOICE }, failures };
 }
 
 async function work() {
@@ -153,7 +164,8 @@ async function mix() {
       continue;
     }
     const mixed = mixChapter(toInt16(samples), timing.starts, segments, songs, SAMPLE_RATE, levels);
-    const out = Object.fromEntries(levels.map((l) => [levelFile(name, l), encodeMp3([mixed[l]])]));
+    const out = Object.fromEntries(levels.map((l) => [levelFile(name, l), encodeMp3([mixed[l]], KBPS)]));
+    out[MIX_MARK] = JSON.stringify({ version: MIX_VERSION });
     await branch.save(out, `Chapter ${ch} with music (${levels.join(", ")})`);
     console.log(`chapter ${ch}: ${segments.length} music segment(s), ${levels.join("/")} mixed in ${((performance.now() - started) / 1000).toFixed(1)} s`);
   }
