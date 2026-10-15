@@ -5,12 +5,14 @@ import { Player } from "./player.js";
 import { VOICES, voiceLabel } from "./voices.js";
 import { formatTime, formatDuration } from "./format.js";
 import { estimateSeconds } from "./plan.js";
+import { MusicEngine, MOODS } from "./music.js";
+import { chapterMood } from "./mood.js";
 
 const $ = (id) => document.getElementById(id);
 const el = new Proxy({}, { get: (_, id) => $(id) });
 
 const CHARS_PER_SECOND = 15; // speaking rate at 1×, for estimates
-const settings = { voice: "af_heart", speed: 1, ...db.loadSettings() };
+const settings = { voice: "af_heart", speed: 1, music: false, musicVolume: 0.45, ...db.loadSettings() };
 const save = () => db.saveSettings(settings);
 
 let cloud = null; // Library, once connected
@@ -214,6 +216,7 @@ let libraryTimer = null;
 
 async function showLibrary() {
   player.close();
+  music.stop();
   book = null;
   clearInterval(bookTimer);
   document.title = "Kokoro Reader";
@@ -404,6 +407,7 @@ async function openPlayer() {
 }
 
 function showPanel(name) {
+  el.musicMenu.hidden = true;
   el.setupPanel.hidden = name !== "setup";
   el.workPanel.hidden = name !== "work";
   el.playerPanel.hidden = name !== "player";
@@ -610,11 +614,32 @@ el.redoBtn.addEventListener("click", startOver);
 
 // ---------- listening ----------
 
+const music = new MusicEngine();
+music.setVolume(settings.musicVolume);
+
+// The mood of a chapter: from the server's reading of the book when it has
+// one, otherwise a quick guess from its words.
+function moodOf(ch) {
+  if (!book) return "reflective";
+  return book.moods?.[ch] || (book.guessedMoods ??= {})[ch] || (book.guessedMoods[ch] = chapterMood(book.chapters[ch]));
+}
+
+function syncMusic() {
+  const on = settings.music && player.playing;
+  el.musicBtn.classList.toggle("on", settings.music);
+  if (on) music.play(moodOf(shownCh));
+  else music.pause();
+  el.musicNow.textContent = settings.music ? `Now: ${MOODS[moodOf(shownCh)]?.label || ""} (chapter ${shownCh + 1})` : "";
+}
+
 let seeking = false;
 let lastPositionUpdate = 0;
 
 const player = new Player(el.audio, {
-  onChapter: (ch) => showChapter(ch),
+  onChapter: (ch) => {
+    showChapter(ch);
+    syncMusic();
+  },
   onSentence: (ch, i) => {
     if (!book) return;
     markSentence(i);
@@ -624,6 +649,7 @@ const player = new Player(el.audio, {
     el.playBtn.textContent = playing ? "❚❚" : "▶";
     el.playBtn.setAttribute("aria-label", playing ? "Pause" : "Play");
     if ("mediaSession" in navigator) navigator.mediaSession.playbackState = playing ? "playing" : "paused";
+    syncMusic();
     if (!book) return;
     if (playing && entry(book.id)?.finished) updateEntry(book.id, { finished: false, finishedAt: Date.now() });
     if (!playing) syncSoon(1500); // save where you paused
@@ -681,11 +707,32 @@ if ("mediaSession" in navigator) {
 
 el.playBtn.addEventListener("click", () => {
   if (player.playing) return player.pause();
+  if (settings.music) music.ensure(); // sound can only start from a tap
   player.play().catch((err) => playerStatus(err.message));
 });
 el.prevBtn.addEventListener("click", () => player.goToSentence(shownCh, player.sentence - 1));
 el.nextBtn.addEventListener("click", () => player.goToSentence(shownCh, player.sentence + 1));
+el.musicBtn.addEventListener("click", () => {
+  el.musicMenu.hidden = !el.musicMenu.hidden;
+  el.moreMenu.hidden = true;
+  el.musicOn.checked = settings.music;
+  el.musicVol.value = Math.round(settings.musicVolume * 100);
+  syncMusic();
+});
+el.musicOn.addEventListener("change", () => {
+  settings.music = el.musicOn.checked;
+  save();
+  if (settings.music) music.ensure();
+  syncMusic();
+});
+el.musicVol.addEventListener("input", () => {
+  settings.musicVolume = el.musicVol.value / 100;
+  music.setVolume(settings.musicVolume);
+  save();
+});
+
 el.moreBtn.addEventListener("click", () => {
+  el.musicMenu.hidden = true;
   el.moreMenu.hidden = !el.moreMenu.hidden;
   const e = entry(book.id);
   el.voiceInfo.textContent = `Voice: ${voiceLabel(e.voice)} · ${formatDuration(e.seconds || 0)} in total`;
