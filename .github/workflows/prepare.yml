@@ -15,6 +15,9 @@ on:
       library:
         description: Library repository (owner/name)
         required: true
+      music:
+        description: Also read the book's moods and compose its background music
+        default: "yes"
 concurrency:
   group: prepare-${{ inputs.book }}
   cancel-in-progress: true
@@ -62,3 +65,40 @@ jobs:
         env:
           CHAPTERS: ${{ matrix.chapters }}
           PART: ${{ github.run_id }}-${{ matrix.part }}
+
+  # Reads the mood of every chapter (alongside the voice work).
+  moods:
+    if: inputs.music == 'yes'
+    runs-on: ubuntu-latest
+    outputs:
+      compose: ${{ steps.moods.outputs.compose }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --omit=dev
+      - id: moods
+        run: node server/music.mjs moods
+
+  # Composes the music for each mood the book has, one machine per mood.
+  compose:
+    needs: moods
+    if: needs.moods.outputs.compose != '[]' && needs.moods.outputs.compose != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        mood: ${{ fromJSON(needs.moods.outputs.compose) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --omit=dev
+      - run: node server/music.mjs compose
+        env:
+          MOOD: ${{ matrix.mood }}

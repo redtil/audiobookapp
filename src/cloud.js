@@ -113,19 +113,30 @@ export class Library {
 
   // ---------- audio ----------
 
-  // { [chapter]: { mp3: sha, json: sha } } for every chapter made so far.
-  async audioIndex(id) {
+  // Everything made for a book so far:
+  //   chapters: { [chapter]: { mp3: sha, json: sha } }
+  //   moods: sha of moods.json, music: { [mood]: sha of its MP3 }
+  async audioAll(id) {
     const refs = (await this.call(`/repos/${this.dataRepo}/git/matching-refs/heads/audio/${id}/`)) || [];
-    const index = {};
+    const chapters = {};
+    const music = {};
+    let moods = null;
     const trees = await Promise.all(refs.map((r) => this.call(`/repos/${this.dataRepo}/git/trees/${r.object.sha}`)));
     for (const tree of trees) {
       for (const f of tree.tree) {
-        const m = f.path.match(/^(\d+)\.(mp3|json)$/);
-        if (m) (index[+m[1]] ??= {})[m[2]] = f.sha;
+        let m;
+        if ((m = f.path.match(/^(\d+)\.(mp3|json)$/))) (chapters[+m[1]] ??= {})[m[2]] = f.sha;
+        else if ((m = f.path.match(/^music-(\w+)\.mp3$/))) music[m[1]] = f.sha;
+        else if (f.path === "moods.json") moods = f.sha;
       }
     }
-    for (const ch of Object.keys(index)) if (!index[ch].mp3 || !index[ch].json) delete index[ch];
-    return index;
+    for (const ch of Object.keys(chapters)) if (!chapters[ch].mp3 || !chapters[ch].json) delete chapters[ch];
+    return { chapters, moods, music };
+  }
+
+  // { [chapter]: { mp3: sha, json: sha } } for every chapter made so far.
+  async audioIndex(id) {
+    return (await this.audioAll(id)).chapters;
   }
 
   async blob(sha) {
@@ -143,7 +154,7 @@ export class Library {
 
   async startPreparing(id, voice) {
     await this.call(`/repos/${this.appRepo}/actions/workflows/prepare.yml/dispatches`, {
-      body: { ref: "main", inputs: { book: id, voice, library: this.dataRepo } },
+      body: { ref: "main", inputs: { book: id, voice, library: this.dataRepo, music: "yes" } },
     });
   }
 

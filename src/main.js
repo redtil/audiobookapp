@@ -1,7 +1,7 @@
 import { readBook, bookIdFor } from "./book.js";
 import * as db from "./db.js";
 import { Library, mergeLibraries, isRemoved } from "./cloud.js";
-import { Player } from "./player.js";
+import { Player, cached } from "./player.js";
 import { VOICES, voiceLabel } from "./voices.js";
 import { formatTime, formatDuration } from "./format.js";
 import { estimateSeconds } from "./plan.js";
@@ -401,6 +401,8 @@ async function openPlayer() {
     const pos = e.pos || { ch: 0, i: 0 };
     await player.open(book, book.index, (sha) => cloud.blob(sha), Math.min(pos.ch, book.chapters.length - 1), pos.i);
     updateMetadata();
+    music.clearClips();
+    loadBookMusic(book);
   } catch (err) {
     playerStatus(`Couldn't load the audio (${err.message}).`);
   }
@@ -629,7 +631,32 @@ function syncMusic() {
   el.musicBtn.classList.toggle("on", settings.music);
   if (on) music.play(moodOf(shownCh));
   else music.pause();
-  el.musicNow.textContent = settings.music ? `Now: ${MOODS[moodOf(shownCh)]?.label || ""} (chapter ${shownCh + 1})` : "";
+  const mood = moodOf(shownCh);
+  const how = book?.musicFiles?.[mood] ? "composed for this book" : "composed live on this device";
+  el.musicNow.textContent = settings.music ? `Now: ${MOODS[mood]?.label || ""}, ${how} (chapter ${shownCh + 1}).` : "";
+  el.composeBtn.hidden = !book || !!book.moods || composing.has(book?.id);
+}
+
+// The moods and music the server made for this book, if any. Loaded in the
+// background when a book opens; until then the live composer plays.
+const composing = new Set();
+async function loadBookMusic(myBook) {
+  try {
+    const all = await cloud.audioAll(myBook.id);
+    if (book !== myBook) return;
+    if (all.moods) myBook.moods = JSON.parse(await (await cached(all.moods, (s) => cloud.blob(s))).text()).moods;
+    const files = {};
+    for (const [mood, sha] of Object.entries(all.music)) {
+      files[mood] = await (await cached(sha, (s) => cloud.blob(s))).arrayBuffer();
+    }
+    if (book !== myBook) return;
+    myBook.musicFiles = all.music;
+    if (Object.keys(files).length) await music.setClips(files);
+    if (all.moods) composing.delete(myBook.id);
+    syncMusic();
+  } catch (err) {
+    console.warn("Couldn't load the book's music", err);
+  }
 }
 
 let seeking = false;
@@ -725,6 +752,23 @@ el.musicOn.addEventListener("change", () => {
   if (settings.music) music.ensure();
   syncMusic();
 });
+el.composeBtn.addEventListener("click", async () => {
+  const id = book.id;
+  el.composeBtn.disabled = true;
+  try {
+    // Preparing again only does what's missing: here, the moods and music.
+    await cloud.startPreparing(id, entry(id).voice || settings.voice);
+    composing.add(id);
+    el.composeInfo.textContent = "Composing on the server. It takes a while; the music switches over by itself next time you open the book.";
+  } catch (err) {
+    el.composeInfo.textContent = err.message;
+  } finally {
+    el.composeInfo.hidden = false;
+    el.composeBtn.disabled = false;
+    syncMusic();
+  }
+});
+
 el.musicVol.addEventListener("input", () => {
   settings.musicVolume = el.musicVol.value / 100;
   music.setVolume(settings.musicVolume);

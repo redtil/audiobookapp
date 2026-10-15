@@ -4,7 +4,7 @@
 
 const CACHE = "kokoro-reader-audio";
 
-async function cached(sha, fetchBlob) {
+export async function cached(sha, fetchBlob) {
   let cache = null;
   try {
     cache = await caches.open(CACHE);

@@ -8,66 +8,28 @@
 // private library), BOOK (book id), VOICE, and for "work" CHAPTERS ("3,7,9")
 // and PART (a name for this machine's share of the work).
 //
-// Library layout (private repository):
-//   main: library.json, books/<id>.json (the text, split into sentences)
-//   branches audio/<id>/<part>: <chapter>.mp3 and <chapter>.json (sentence
-//   start times), one branch per machine so they never get in each other's way.
-//
-// This runs in a public repository, so it never logs a book's title or text.
+// Audio goes to branches audio/<id>/<part> (see library.mjs): <chapter>.mp3
+// and <chapter>.json (sentence start times).
 
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, appendFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { loadVoice, trimSilence, encodeMp3, toInt16, SAMPLE_RATE } from "./voice.mjs";
 import { planParts } from "../src/plan.js";
+import { readBook, audioFiles, ownBranch, output } from "./library.mjs";
 
-const { LIBRARY_KEY, DATA_REPO, BOOK, VOICE = "af_heart" } = process.env;
-const API = process.env.GITHUB_API || "https://api.github.com";
+const { BOOK, VOICE = "af_heart" } = process.env;
 const PAUSE = { sentence: 0.28, paragraph: 0.65, chapter: 1.5 };
 const CHARS_PER_PART = +process.env.CHARS_PER_PART || undefined;
 
-async function api(path, { raw = false, ...opts } = {}) {
-  const res = await fetch(`${API}${path}`, {
-    ...opts,
-    headers: {
-      Authorization: `Bearer ${LIBRARY_KEY}`,
-      Accept: raw ? "application/vnd.github.raw+json" : "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-      ...opts.headers,
-    },
-  });
-  if (res.status === 404) return null;
-  if (!res.ok) throw new Error(`${opts.method || "GET"} ${path.split("?")[0]} failed: ${res.status} ${await res.text()}`);
-  return raw ? res : res.json();
-}
-
-async function readBook() {
-  const res = await api(`/repos/${DATA_REPO}/contents/books/${BOOK}.json`, { raw: true });
-  if (!res) throw new Error("This book isn't in the library.");
-  return res.json();
-}
-
 // Chapters that already have audio, from every machine's branch.
 async function finishedChapters() {
-  const refs = (await api(`/repos/${DATA_REPO}/git/matching-refs/heads/audio/${BOOK}/`)) || [];
   const done = new Set();
-  for (const ref of refs) {
-    const tree = await api(`/repos/${DATA_REPO}/git/trees/${ref.object.sha}`);
-    for (const f of tree?.tree || []) {
-      const m = f.path.match(/^(\d+)\.json$/);
-      if (m) done.add(+m[1]);
-    }
+  for (const name of Object.keys(await audioFiles())) {
+    const m = name.match(/^(\d+)\.json$/);
+    if (m) done.add(+m[1]);
   }
   return done;
 }
 
 const chapterChars = (c) => c.paras.reduce((n, p) => n + p.reduce((m, s) => m + s.length, 0), 0);
-
-function output(name, value) {
-  if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `${name}=${value}\n`);
-  else console.log(`${name}=${value}`);
-}
 
 async function plan() {
   const book = await readBook();
@@ -82,10 +44,6 @@ async function plan() {
 }
 
 // ---------- work ----------
-
-function git(dir, ...args) {
-  return execFileSync("git", args, { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
-}
 
 async function makeChapter(speak, chapter, ch) {
   const flat = chapter.paras.flat();
@@ -116,35 +74,15 @@ async function makeChapter(speak, chapter, ch) {
 
 async function work() {
   const chapters = process.env.CHAPTERS.split(",").filter(Boolean).map(Number);
-  const branch = `audio/${BOOK}/${process.env.PART}`;
   const book = await readBook();
   const speak = await loadVoice();
-
-  const dir = mkdtempSync(join(tmpdir(), "audio-"));
-  git(dir, "init", "-q", "-b", "audio");
-  git(dir, "config", "user.name", "Kokoro Reader");
-  git(dir, "config", "user.email", "reader@users.noreply.github.com");
-  const remote = process.env.DATA_REMOTE || `https://x-access-token:${LIBRARY_KEY}@github.com/${DATA_REPO}.git`;
-  git(dir, "remote", "add", "origin", remote);
-
+  const branch = ownBranch(process.env.PART);
   for (const ch of chapters) {
     const started = performance.now();
     const { mp3, timing, failures } = await makeChapter(speak, book.chapters[ch], ch);
     const name = String(ch).padStart(4, "0");
-    writeFileSync(join(dir, `${name}.mp3`), mp3);
-    writeFileSync(join(dir, `${name}.json`), JSON.stringify(timing));
-    git(dir, "add", ".");
-    git(dir, "commit", "-q", "-m", `Chapter ${ch}`);
     // Each chapter is saved as soon as it's done, so pausing loses little.
-    for (let attempt = 1; ; attempt++) {
-      try {
-        git(dir, "push", "-q", "--force", "origin", `HEAD:refs/heads/${branch}`);
-        break;
-      } catch (err) {
-        if (attempt >= 5) throw err;
-        await new Promise((r) => setTimeout(r, 2000 * attempt));
-      }
-    }
+    await branch.save({ [`${name}.mp3`]: mp3, [`${name}.json`]: JSON.stringify(timing) }, `Chapter ${ch}`);
     const took = (performance.now() - started) / 1000;
     console.log(`chapter ${ch}: ${(timing.duration / 60).toFixed(1)} min of audio in ${(took / 60).toFixed(1)} min` +
       ` (${(timing.duration / took).toFixed(1)}× real time)${failures ? `, ${failures} sentences skipped` : ""}`);

@@ -46,6 +46,7 @@ export class MusicEngine {
     this.mood = null;
     this.layer = null; // the mood currently sounding: { gain, timer, mood }
     this.playing = false;
+    this.clips = {}; // mood -> AudioBuffer of composed music, when the book has it
   }
 
   // Must first be called from a tap (browsers only allow sound after one).
@@ -128,6 +129,31 @@ export class MusicEngine {
     this.suspendTimer = setTimeout(() => !this.playing && ctx.suspend(), 4000);
   }
 
+  // Music composed for this book on the server: { mood: ArrayBuffer of MP3 }.
+  // Moods without a clip keep using the live composer.
+  async setClips(files) {
+    this.ensure();
+    this.clips = {};
+    if (!this.ctx) return;
+    for (const [mood, data] of Object.entries(files)) {
+      try {
+        this.clips[mood] = await this.ctx.decodeAudioData(data);
+      } catch (err) {
+        console.warn(`Couldn't decode the ${mood} music`, err);
+      }
+    }
+    // Switch to the composed version of the current mood, if there is one.
+    const current = this.mood;
+    if (current && this.clips[current]) {
+      this.mood = null;
+      this.setMood(current);
+    }
+  }
+
+  clearClips() {
+    this.clips = {};
+  }
+
   // Crossfade into another mood's music.
   setMood(moodName) {
     const mood = MOODS[moodName] || MOODS.reflective;
@@ -135,14 +161,29 @@ export class MusicEngine {
     this.mood = moodName;
     const old = this.layer;
     if (old) {
-      clearInterval(old.timer);
+      if (old.timer) clearInterval(old.timer);
       old.gain.gain.setTargetAtTime(0, this.ctx.currentTime, 2.5);
       setTimeout(() => {
         old.sources.forEach((s) => s.stop());
         old.gain.disconnect();
       }, 15000);
     }
-    this.layer = this.startLayer(mood);
+    this.layer = this.clips[moodName] ? this.startClip(this.clips[moodName], mood) : this.startLayer(mood);
+  }
+
+  // A composed clip, looped (the server makes its end flow into its start).
+  startClip(buffer, mood) {
+    const { ctx } = this;
+    const gain = ctx.createGain();
+    gain.gain.value = 0;
+    gain.gain.setTargetAtTime(1.6, ctx.currentTime, 2.5);
+    gain.connect(this.master);
+    const src = ctx.createBufferSource();
+    src.buffer = buffer;
+    src.loop = true;
+    src.connect(gain);
+    src.start(ctx.currentTime + 0.05, Math.random() * buffer.duration * 0.5);
+    return { gain, mood, sources: [src], timer: null };
   }
 
   stop() {
