@@ -179,11 +179,29 @@ async function pdfPageLines(page) {
   }
   for (const l of lines) {
     // The line's size is the size most of its letters have.
-    l.size = +Object.entries(l.sizes).sort((a, b) => b[1] - a[1])[0]?.[0] || l.size;
-    l.text = l.text.trim();
+    // The line's size: the middle size of its letters (scans give each word
+    // its own size, so it wobbles from word to word).
+    const sizes = Object.entries(l.sizes).map(([k, n]) => [+k, n]).sort((a, b) => a[0] - b[0]);
+    const half = sizes.reduce((n, [, c]) => n + c, 0) / 2;
+    let seen = 0;
+    l.size = sizes.find(([, c]) => (seen += c) >= half)?.[0] || l.size;
+    l.text = cleanOcr(l.text);
   }
   return lines.filter((l) => l.text);
 }
+
+// Specks a scan's text recognition turns into symbols: « • * ■ and the like.
+const JUNK = /[«»•·■□▪◆●○©®™¬\\^~|¦¤]/g;
+function cleanOcr(text) {
+  return text
+    .split(/\s+/)
+    .map((w) => (/[\p{L}\p{N}]/u.test(w.replace(JUNK, "")) ? w.replace(JUNK, "").replace(/\*+$|^\*+/g, "") : ""))
+    .filter(Boolean)
+    .join(" ");
+}
+
+// Lines that aren't the book: a scanning service's notice and web links.
+const NOT_THE_BOOK = /^(digitized by\b|https?:\/\/|www\.)\S*/i;
 
 const mostCommon = (values) => {
   const counts = new Map();
@@ -224,9 +242,21 @@ function dropPageFurniture(pages, layout) {
   pages = pages.map((lines) => {
     lines = lines.filter((l, i) =>
       !((l.pos < 0.12 || l.pos > 0.86 || i === 0 || i === lines.length - 1) && PAGE_NUMBER.test(l.text)));
+    // Specks left over from a scan: a letter or two on their own, in the margin.
+    lines = lines.filter((l) => !(l.text.replace(/[^\p{L}\p{N}]/gu, "").length <= 2 && !/^(I|a|A)$/.test(l.text)));
+    // A scanning service's notice ("Digitized by ... https://...").
+    const notice = lines.findIndex((l) => /^digitized by\b/i.test(l.text));
+    const link = lines.findIndex((l, i) => i >= notice && /^https?:\/\//i.test(l.text));
+    if (notice >= 0 && link >= notice && link - notice < 5) lines.splice(notice, link - notice + 1);
+    lines = lines.filter((l) => !NOT_THE_BOOK.test(l.text) || l.text.split(" ").length > 3);
+    // A running header with the page number in it, like "12 The Animal-Machine":
+    // short, at the top, starting or ending with a number.
+    const head = lines[0];
+    if (head && head.pos < 0.15 && /^\d{1,4}\s+\S|\S\s+\d{1,4}$/.test(head.text) && head.text.length < 70 &&
+        !ENDS_SENTENCE.test(head.text.replace(/\s*\d+$/, ""))) lines = lines.slice(1);
     // Footnotes: the smaller lines at the bottom, below the last line of text.
     let cut = lines.length;
-    while (cut > 0 && lines[cut - 1].pos > 0.45 && lines[cut - 1].size < layout.size * 0.9) cut--;
+    while (cut > 0 && lines[cut - 1].pos > 0.45 && lines[cut - 1].size < layout.size * 0.88) cut--;
     return lines.slice(0, cut);
   });
   // Lines repeating near the top or bottom of many pages (odd and even pages
@@ -240,8 +270,16 @@ function dropPageFurniture(pages, layout) {
       for (const c of [counts[n % 2], counts[2]]) c.set(k, (c.get(k) || 0) + 1);
     }
   });
+  // Each chapter often has its own running header, so also count nearby pages.
+  const nearby = (k, n) => {
+    let c = 0;
+    for (let m = Math.max(0, n - 8); m <= Math.min(pages.length - 1, n + 8); m++) if (edgeKeys[m].has(k)) c++;
+    return c;
+  };
+  const edgeKeys = pages.map((lines) => new Set(edges(lines).map(key)));
   const repeats = (k, n) =>
-    counts[2].get(k) >= Math.max(3, pages.length * 0.4) || counts[n % 2].get(k) >= Math.max(2, (pages.length / 2) * 0.5);
+    counts[2].get(k) >= Math.max(3, pages.length * 0.4) || counts[n % 2].get(k) >= Math.max(2, (pages.length / 2) * 0.5) ||
+    nearby(k, n) >= 3;
   return pages.map((lines, n) => {
     const edge = new Set(edges(lines));
     return lines.filter((l) => !(edge.has(l) && repeats(key(l), n)));
@@ -253,9 +291,11 @@ const ENDS_SENTENCE = /[.!?…:;"”’)\]]$/;
 // Whether line b starts a new paragraph after line a.
 function newParagraph(a, b, layout, samePage) {
   const startsLower = /^[\p{Ll}]/u.test(b.text);
-  const heading = (l) => l.size > layout.size * 1.12;
+  if (/\p{L}[-‐]$/u.test(a.text) && startsLower) return false; // a word split over two lines
+  const ratio = b.size / a.size;
+  if (!ENDS_SENTENCE.test(a.text) && startsLower && ratio > 0.8 && ratio < 1.25) return false; // mid-sentence
+  const heading = (l) => l.size > layout.size * 1.25;
   if (heading(a) !== heading(b) || (heading(a) && heading(b) && samePage && a.y - b.y > a.size * 1.8)) return true;
-  if (!ENDS_SENTENCE.test(a.text) && startsLower) return false; // mid-sentence
   if (samePage && a.y - b.y > layout.gap * 1.45) return true; // a gap between paragraphs
   const short = (l) => layout.right && l.end < layout.right - layout.size * 3;
   if (ENDS_SENTENCE.test(a.text) && short(b) && !ENDS_SENTENCE.test(b.text)) return true; // a heading
