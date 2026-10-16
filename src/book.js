@@ -152,7 +152,8 @@ async function pdfPageLines(page) {
     const raised = cur && size < 0.8 * cur.size && dy > 1 && dy < 0.7 * cur.size;
     if (raised) {
       if (/^[\s\d*†‡§¶,\-–]+$/.test(it.str)) continue; // a footnote marker
-    } else if (!cur || dy > Math.max(2, 0.4 * Math.min(size, cur.size))) {
+    } else if (!cur || dy > Math.max(2, 0.4 * Math.min(size, cur.size)) || (last && x - last.end > 8 * size)) {
+      // A new line (or text far off to the side: another column, or a speck).
       cur = { text: "", size, sizes: {}, x, end: x, y, pos: 1 - (y - bottom) / Math.max(1, top - bottom) };
       lines.push(cur);
       last = null;
@@ -234,16 +235,29 @@ function bodyLayout(pages) {
   };
 }
 
+// A page's topmost and bottom line.
+function ends(lines) {
+  let top = lines[0];
+  let bottom = lines[0];
+  for (const l of lines) {
+    if (l.y > top.y) top = l;
+    if (l.y < bottom.y) bottom = l;
+  }
+  return [top, bottom];
+}
+
 const PAGE_NUMBER = /^(page\s+)?[-–—(\[]?\s*(\d{1,4}|[ivxlcdm]{1,7})\s*[-–—)\]]?$/i;
 
 // Leaves out what isn't the book's text: page numbers, footnotes at the foot
 // of the page (smaller than the text), and running headers and footers.
 function dropPageFurniture(pages, layout) {
   pages = pages.map((lines) => {
-    lines = lines.filter((l, i) =>
-      !((l.pos < 0.12 || l.pos > 0.86 || i === 0 || i === lines.length - 1) && PAGE_NUMBER.test(l.text)));
-    // Specks left over from a scan: a letter or two on their own, in the margin.
-    lines = lines.filter((l) => !(l.text.replace(/[^\p{L}\p{N}]/gu, "").length <= 2 && !/^(I|a|A)$/.test(l.text)));
+    // The top and bottom lines by position (not every PDF stores them first and last).
+    const [top, bottom] = ends(lines);
+    lines = lines.filter((l) => !((l.pos < 0.12 || l.pos > 0.86 || l === top || l === bottom) && PAGE_NUMBER.test(l.text)));
+    // Specks left over from a scan: a letter or two on their own, out in the margin.
+    const inMargin = (l) => l.end < layout.left - layout.size * 0.5 || (layout.right && l.x > layout.right - layout.size * 0.5);
+    lines = lines.filter((l) => !(l.text.replace(/[^\p{L}\p{N}]/gu, "").length <= 2 && inMargin(l)));
     // A scanning service's notice ("Digitized by ... https://...").
     const notice = lines.findIndex((l) => /^digitized by\b/i.test(l.text));
     const link = lines.findIndex((l, i) => i >= notice && /^https?:\/\//i.test(l.text));
@@ -251,19 +265,28 @@ function dropPageFurniture(pages, layout) {
     lines = lines.filter((l) => !NOT_THE_BOOK.test(l.text) || l.text.split(" ").length > 3);
     // A running header with the page number in it, like "12 The Animal-Machine":
     // short, at the top, starting or ending with a number.
-    const head = lines[0];
+    const head = ends(lines)[0];
     if (head && head.pos < 0.15 && /^\d{1,4}\s+\S|\S\s+\d{1,4}$/.test(head.text) && head.text.length < 70 &&
-        !ENDS_SENTENCE.test(head.text.replace(/\s*\d+$/, ""))) lines = lines.slice(1);
-    // Footnotes: the smaller lines at the bottom, below the last line of text.
+        !ENDS_SENTENCE.test(head.text.replace(/\s*\d+$/, ""))) head.header = true; // left out below
+    // Footnotes: smaller lines at the foot of the page, set apart from the text
+    // above (by a gap, or starting with a note number).
     let cut = lines.length;
     while (cut > 0 && lines[cut - 1].pos > 0.45 && lines[cut - 1].size < layout.size * 0.88) cut--;
-    return lines.slice(0, cut);
+    if (cut < lines.length) {
+      const first = lines[cut];
+      const apart = cut === 0 || lines[cut - 1].y - first.y > layout.gap * 1.3;
+      if (apart || /^(\d{1,3}|[*†‡§])\s?\S/.test(first.text)) lines = lines.slice(0, cut);
+    }
+    return lines;
   });
   // Lines repeating near the top or bottom of many pages (odd and even pages
   // often differ, so each are counted on their own).
-  const key = (l) => l.text.replace(/\d+/g, "#").toLowerCase();
-  const edges = (lines) => [...lines.slice(0, 2), ...lines.slice(-2)].filter((l) =>
-    l.pos < 0.12 || l.pos > 0.88 || ((l === lines[0] || l === lines.at(-1)) && !ENDS_SENTENCE.test(l.text)));
+  const key = (l) => l.text.replace(/\d+/g, "").replace(/\s+/g, " ").trim().toLowerCase();
+  const edges = (lines) => {
+    const byY = [...lines].sort((a, b) => b.y - a.y);
+    return [...new Set([...byY.slice(0, 2), ...byY.slice(-2)])].filter((l) => l.size < layout.size * 1.2 && key(l) && (
+      l.pos < 0.12 || l.pos > 0.88 || ((l === byY[0] || l === byY.at(-1)) && !ENDS_SENTENCE.test(l.text))));
+  };
   const counts = [new Map(), new Map(), new Map()]; // even pages, odd pages, all
   pages.forEach((lines, n) => {
     for (const k of new Set(edges(lines).map(key))) {
@@ -282,7 +305,7 @@ function dropPageFurniture(pages, layout) {
     nearby(k, n) >= 3;
   return pages.map((lines, n) => {
     const edge = new Set(edges(lines));
-    return lines.filter((l) => !(edge.has(l) && repeats(key(l), n)));
+    return lines.filter((l) => !l.header && !(edge.has(l) && repeats(key(l), n)));
   });
 }
 
@@ -297,7 +320,8 @@ function newParagraph(a, b, layout, samePage) {
   const heading = (l) => l.size > layout.size * 1.25;
   if (heading(a) !== heading(b) || (heading(a) && heading(b) && samePage && a.y - b.y > a.size * 1.8)) return true;
   if (samePage && a.y - b.y > layout.gap * 1.45) return true; // a gap between paragraphs
-  const short = (l) => layout.right && l.end < layout.right - layout.size * 3;
+  // Stopped well short of the right edge (not just a long word wrapping early).
+  const short = (l) => layout.right && l.end < layout.right - Math.max(layout.size * 3, (layout.right - layout.left) * 0.3);
   if (ENDS_SENTENCE.test(a.text) && short(b) && !ENDS_SENTENCE.test(b.text)) return true; // a heading
   if (b.x > layout.left + layout.size * 0.8 && b.x < layout.left + layout.size * 8) return true; // indented
   if (short(a)) return true; // the line before stopped short
@@ -313,6 +337,28 @@ function linesText(flat, from, to, layout) {
     text += l.text;
   }
   return text;
+}
+
+// Without bookmarks, chapters start at big headings near the top of a page
+// ("Chapter Two" / "The Animal-Machine" becomes "Chapter Two: The Animal-Machine").
+function headingMarks(flat, layout) {
+  const big = (l) => l.size >= layout.size * 1.3 && l.pos < 0.5 && /\p{L}{3}/u.test(l.text) && l.text.length < 80;
+  const marks = [];
+  for (let i = 0; i < flat.length; i++) {
+    const l = flat[i];
+    if (!big(l) || (i > 0 && flat[i - 1].page === l.page && big(flat[i - 1]))) continue;
+    // Only within the first few lines of its page.
+    let k = i;
+    while (k > 0 && flat[k - 1].page === l.page) k--;
+    if (i - k > 2) continue;
+    let j = i;
+    const parts = [];
+    while (j < flat.length && flat[j].page === l.page && big(flat[j]) && parts.length < 3) parts.push(flat[j++].text);
+    const last = marks.at(-1);
+    if (last && flat[last.at].page >= l.page - 1) continue; // too close to the last one
+    marks.push({ title: parts.join(": ").replace(/:\s*:/g, ":"), at: i });
+  }
+  return marks;
 }
 
 async function readPdf(file) {
@@ -354,6 +400,11 @@ async function readPdf(file) {
 
   const chapters = [];
   if (marks.length >= 2) {
+    if (marks[0].at > 0) marks.unshift({ title: "Opening pages", at: 0 });
+    marks.forEach((m, i) => {
+      chapters.push({ title: m.title, text: tidy(linesText(flat, m.at, marks[i + 1]?.at ?? flat.length, layout)) });
+    });
+  } else if ((marks = headingMarks(flat, layout)).length >= 3) {
     if (marks[0].at > 0) marks.unshift({ title: "Opening pages", at: 0 });
     marks.forEach((m, i) => {
       chapters.push({ title: m.title, text: tidy(linesText(flat, m.at, marks[i + 1]?.at ?? flat.length, layout)) });
