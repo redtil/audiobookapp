@@ -151,18 +151,30 @@ function estimateFor(e, index = {}) {
 
 // Share of the work done, for the progress bar. Finished chapters alone
 // lag behind (every machine is mid-chapter until near the end), so while
-// it's running this also counts time elapsed against the estimate.
+// it's running this also counts time elapsed against the estimate. It never
+// goes backwards while a run is going.
+const shown = {}; // id -> highest share shown
+// id -> { at, seconds }: when this device expects the server to be done.
+// Seeded from the entry's estimate (from the device that started it).
+const etas = {};
+const etaOf = (e) => (e ? (etas[e.id] ||= e.eta || null) : null);
 function progress(e, st) {
   if (!st) return 0;
-  if (!st.running || !e?.eta) return st.done;
-  const elapsed = (Date.now() - e.eta.at) / 1000;
-  const byTime = Math.min(0.97, elapsed / Math.max(1, elapsed + secondsLeft(e)));
-  return Math.max(st.done, byTime);
+  const eta = etaOf(e);
+  if (!st.running || !eta) {
+    delete shown[e?.id];
+    return st.done;
+  }
+  const elapsed = (Date.now() - eta.at) / 1000;
+  const byTime = st.waiting ? 0 : Math.min(0.97, elapsed / Math.max(1, elapsed + secondsLeft(e)));
+  shown[e.id] = Math.max(shown[e.id] || 0, st.done, byTime);
+  return shown[e.id];
 }
 
 function secondsLeft(e) {
-  if (!e?.eta) return null;
-  return Math.max(0, (e.eta.at + e.eta.seconds * 1000 - Date.now()) / 1000);
+  const eta = etaOf(e);
+  if (!eta) return null;
+  return Math.max(0, (eta.at + eta.seconds * 1000 - Date.now()) / 1000);
 }
 
 function countdown(sec) {
@@ -184,23 +196,31 @@ async function refreshStatus(id, runs) {
   const running = !!run && run.status !== "completed";
   // A run takes a few seconds to show up after it's started.
   const starting = !running && e.startedAt && Date.now() - e.startedAt < 90_000 && made < e.chapters;
+  const waiting = running && (await cloud.waiting(run).catch(() => false));
   status[id] = {
     index,
     made,
     done: madeChars / total,
     running: running || starting,
+    waiting,
     failed: !running && !starting && run?.conclusion === "failure",
     startedAt: run?.run_started_at ? Date.parse(run.run_started_at) : e.startedAt,
   };
-  if (status[id].running && !e.eta) {
-    e.eta = { ...estimateFor(e, index), at: status[id].startedAt || Date.now() };
-    db.saveLibrary(library);
-  } else if (status[id].running && secondsLeft(e) === 0) {
-    // Took longer than expected (another book may have been using the
-    // machines): estimate again from the chapters that are left.
-    const todo = sizes.map((_, ch) => ch).filter((ch) => !index[ch]);
-    e.eta = { at: Date.now(), seconds: Math.round(estimateSeconds(sizes, todo, { startup: false })) + 30 };
-    db.saveLibrary(library);
+  // The estimate is kept on this device only: copies synced from other
+  // devices would otherwise keep replacing it.
+  const todo = sizes.map((_, ch) => ch).filter((ch) => !index[ch]);
+  if (!status[id].running) delete etas[id];
+  else if (waiting) {
+    // The clock starts once a machine is free.
+    etas[id] = estimateFor(e, index);
+  } else if (!etaOf(e)) {
+    etas[id] = { ...estimateFor(e, index), at: status[id].startedAt || Date.now() };
+  } else if (secondsLeft(e) === 0) {
+    // Taking longer than expected: push the end back by what's left, keeping
+    // the start, so the bar carries on from where it is.
+    const { at } = etas[id];
+    const elapsed = (Date.now() - at) / 1000;
+    etas[id] = { at, seconds: Math.round(elapsed + estimateSeconds(sizes, todo, { startup: false }) + 30) };
   }
   if (made === e.chapters && e.chapters > 0) await markReady(id, index);
   return status[id];
@@ -274,9 +294,11 @@ function renderBooks() {
       if (e.finished) tags.push(`<span class="tag done">Finished</span>`);
       else if (e.pos && (e.pos.ch || e.pos.i)) tags.push(`<span class="tag">Paused at chapter ${e.pos.ch + 1} of ${e.chapters}</span>`);
       else tags.push(`<span class="tag">Not started</span>`);
-    } else if (!st && !e.voice) tags.push(`<span class="tag">Not prepared yet</span>`);
+    } else if (!st?.running && !e.voice && e.failedAt) tags.push(`<span class="tag warn">Preparing failed and was cleared · try again</span>`);
+    else if (!st && !e.voice) tags.push(`<span class="tag">Not prepared yet</span>`);
     else if (!st) tags.push(`<span class="tag">Checking…</span>`);
     else if (!st.running && !st.made && !e.voice) tags.push(`<span class="tag">Not prepared yet</span>`);
+    else if (st.running && st.waiting) tags.push(`<span class="tag busy">Waiting for a free server${pct ? ` · ${pct}%` : ""}</span>`);
     else if (st.running) {
       const left = secondsLeft(e);
       tags.push(`<span class="tag busy">Preparing · ${pct}%${left ? ` · ${formatDuration(left)} left` : ""}</span>`);
@@ -411,7 +433,11 @@ async function showBookState() {
   if (e.ready) return openPlayer();
   if (!e.voice) {
     const st = await refreshStatus(book.id).catch(() => null);
-    if (!st?.running && !st?.made) return showSetup();
+    if (!st?.running && !st?.made) {
+      showSetup();
+      if (e.failedAt) setupStatus("The last try went wrong on the server, so it was cleared away. Tap Prepare to try again.", true);
+      return;
+    }
   }
   showWork();
   const myBook = book;
@@ -563,7 +589,9 @@ async function startPreparing(voice) {
     return;
   }
   const eta = estimateFor(entry(id), status[id]?.index);
-  updateEntry(id, { voice, startedAt: Date.now(), eta, ready: false, audioAt: Date.now() }, 0);
+  etas[id] = eta;
+  delete shown[id];
+  updateEntry(id, { voice, startedAt: Date.now(), eta, ready: false, failedAt: 0, audioAt: Date.now() }, 0);
   status[id] = { index: {}, made: 0, done: 0, ...status[id], running: true, failed: false, startedAt: Date.now() };
   await syncNow(); // so other devices see it straight away, even if this one closes
   if (book?.id === id) showBookState();
@@ -590,7 +618,7 @@ function showWork() {
   const e = entry(book.id);
   const st = status[book.id];
   const running = !st || st.running;
-  el.workTitle.textContent = !st ? "Checking…" : running ? `Preparing${e.voice ? ` with ${voiceLabel(e.voice)}` : ""}` : st.failed ? "Stopped" : "Paused";
+  el.workTitle.textContent = !st ? "Checking…" : running ? (st.waiting ? "In line" : `Preparing${e.voice ? ` with ${voiceLabel(e.voice)}` : ""}`) : st.failed ? "Stopped" : "Paused";
   showProgress();
   el.pauseBtn.hidden = !running;
   el.resumeBtn.hidden = running;
@@ -610,7 +638,10 @@ function showProgress() {
   const pct = `${Math.floor(done * 100)}%`;
   const chapters = `${st.made} of ${e.chapters} chapters ready`;
   el.workBar.style.width = `${done * 100}%`;
-  if (st.running) {
+  if (st.running && st.waiting) {
+    el.workPct.textContent = "Waiting";
+    el.workInfo.textContent = `Waiting for a free server: other books are being prepared first. ${chapters}. It starts by itself, even if you close the app.`;
+  } else if (st.running) {
     const left = secondsLeft(e);
     el.workPct.textContent = left == null ? pct : countdown(left);
     el.workInfo.textContent = `${pct} · ${chapters}. It keeps going on the server, even if you close the app.`;
@@ -628,6 +659,7 @@ el.pauseBtn.addEventListener("click", async () => {
   try {
     await cloud.pause(id);
     updateEntry(id, { startedAt: 0, eta: null, audioAt: Date.now() }, 0);
+    delete etas[id];
     if (status[id]) status[id].running = false;
     if (book?.id === id) showWork();
   } catch (err) {

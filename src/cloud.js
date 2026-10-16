@@ -194,6 +194,14 @@ export class Library {
     return out;
   }
 
+  // True while a run is waiting for free machines: it hasn't started, or
+  // none of its jobs is running yet (other books are using them all).
+  async waiting(run) {
+    if (run.status !== "in_progress") return true;
+    const { jobs } = await this.call(`/repos/${this.appRepo}/actions/runs/${run.id}/jobs?per_page=100`);
+    return jobs.some((j) => j.status !== "completed") && !jobs.some((j) => j.status === "in_progress");
+  }
+
   async pause(id) {
     for (const r of await this.activeRuns(id)) {
       await this.call(`/repos/${this.appRepo}/actions/runs/${r.id}/cancel`, { method: "POST", ok404: true }).catch(() => {});
@@ -203,7 +211,7 @@ export class Library {
 
 // ---------- merging (pure) ----------
 // Entry: { id, title, chapters, total, chars, addedAt, deletedAt,
-//          voice, ready, seconds, audioAt, startedAt, eta: { at, seconds },
+//          voice, ready, seconds, audioAt, startedAt, eta: { at, seconds }, failedAt,
 //          pos: { ch, i, at }, finished, finishedAt }
 
 const newer = (a, b, key) => ((a?.[key] || 0) >= (b?.[key] || 0) ? a : b);
@@ -226,6 +234,7 @@ function mergeEntry(a, b) {
     audioAt: audio.audioAt,
     eta: audio.eta,
     startedAt: audio.startedAt,
+    failedAt: audio.failedAt,
     deletedAt: Math.max(a.deletedAt || 0, b.deletedAt || 0) || undefined,
   };
 }

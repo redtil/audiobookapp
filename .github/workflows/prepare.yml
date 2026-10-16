@@ -110,7 +110,7 @@ jobs:
   # voice and the music are both made.
   mix:
     needs: [plan, work, moods, compose]
-    if: ${{ !cancelled() && inputs.music == 'yes' && needs.moods.result == 'success' && needs.plan.outputs.mixparts != '[]' }}
+    if: ${{ !cancelled() && inputs.music == 'yes' && needs.plan.result == 'success' && needs.work.result != 'failure' && needs.moods.result == 'success' && needs.plan.outputs.mixparts != '[]' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -127,3 +127,19 @@ jobs:
         env:
           CHAPTERS: ${{ matrix.chapters }}
           PART: mix-${{ github.run_id }}-${{ matrix.part }}
+
+  # After a failure (not a pause), removes what the run left half-made.
+  clean:
+    needs: [plan, work, moods, compose, mix]
+    if: ${{ failure() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --omit=dev --ignore-scripts
+      - run: node server/prepare.mjs clean
+        env:
+          NARRATION: ${{ (needs.plan.result == 'failure' || needs.work.result == 'failure') && 'failure' || 'success' }}

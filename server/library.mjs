@@ -12,19 +12,34 @@ import { join } from "node:path";
 const { LIBRARY_KEY, DATA_REPO, BOOK } = process.env;
 const API = process.env.GITHUB_API || "https://api.github.com";
 
+// Retries network hiccups and busy-server replies, so one dropped
+// connection doesn't fail a whole job.
 export async function api(path, { raw = false, ...opts } = {}) {
-  const res = await fetch(`${API}${path}`, {
-    ...opts,
-    headers: {
-      Authorization: `Bearer ${LIBRARY_KEY}`,
-      Accept: raw ? "application/vnd.github.raw+json" : "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-      ...opts.headers,
-    },
-  });
-  if (res.status === 404) return null;
-  if (!res.ok) throw new Error(`${opts.method || "GET"} ${path.split("?")[0]} failed: ${res.status} ${await res.text()}`);
-  return raw ? res : res.json();
+  for (let attempt = 1; ; attempt++) {
+    let res;
+    try {
+      res = await fetch(`${API}${path}`, {
+        ...opts,
+        headers: {
+          Authorization: `Bearer ${LIBRARY_KEY}`,
+          Accept: raw ? "application/vnd.github.raw+json" : "application/vnd.github+json",
+          "X-GitHub-Api-Version": "2022-11-28",
+          ...opts.headers,
+        },
+      });
+    } catch (err) {
+      if (attempt >= 6) throw err;
+      console.warn(`${opts.method || "GET"} ${path.split("?")[0]}: ${err.message}, trying again`);
+      res = null;
+    }
+    if (res?.status === 404 || res?.status === 204) return null;
+    if (res?.ok) return raw ? res : res.json();
+    if (res && res.status !== 429 && res.status < 500) {
+      throw new Error(`${opts.method || "GET"} ${path.split("?")[0]} failed: ${res.status} ${await res.text()}`);
+    }
+    if (res && attempt >= 6) throw new Error(`${opts.method || "GET"} ${path.split("?")[0]} failed: ${res.status}`);
+    await new Promise((r) => setTimeout(r, Math.min(30_000, 1500 * 2 ** attempt)));
+  }
 }
 
 export async function readBook() {
@@ -58,8 +73,39 @@ export async function deleteBranch(ref) {
 }
 
 export async function readBlob(sha) {
-  const res = await api(`/repos/${DATA_REPO}/git/blobs/${sha}`, { raw: true });
-  return Buffer.from(await res.arrayBuffer());
+  // The download itself can drop part-way, so that's retried too.
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const res = await api(`/repos/${DATA_REPO}/git/blobs/${sha}`, { raw: true });
+      return Buffer.from(await res.arrayBuffer());
+    } catch (err) {
+      if (attempt >= 4) throw err;
+      console.warn(`download: ${err.message}, trying again`);
+      await new Promise((r) => setTimeout(r, 3000 * attempt));
+    }
+  }
+}
+
+// Changes this book's entry in library.json (merged with whatever another
+// device wrote in between).
+export async function updateLibraryEntry(fields) {
+  for (let attempt = 1; ; attempt++) {
+    const file = await api(`/repos/${DATA_REPO}/contents/library.json`);
+    if (!file) return;
+    const data = JSON.parse(Buffer.from(file.content, "base64").toString("utf8"));
+    if (!data.books?.[BOOK]) return;
+    Object.assign(data.books[BOOK], fields);
+    try {
+      await api(`/repos/${DATA_REPO}/contents/library.json`, {
+        method: "PUT",
+        body: JSON.stringify({ message: "Update library", sha: file.sha,
+          content: Buffer.from(JSON.stringify(data, null, 1)).toString("base64") }),
+      });
+      return;
+    } catch (err) {
+      if (attempt >= 5 || !/ (409|422) /.test(err.message)) throw err;
+    }
+  }
 }
 
 function git(dir, ...args) {

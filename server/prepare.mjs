@@ -5,6 +5,8 @@
 //   node server/prepare.mjs work   make the audio for one group of chapters
 //   node server/prepare.mjs mix    mix the book's music into one group of
 //                                  chapters (after the voice and music are made)
+//   node server/prepare.mjs clean  after a failed run: remove what it left
+//                                  half-made (NARRATION=failure: everything)
 //
 // Environment: LIBRARY_KEY (access token), DATA_REPO (owner/name of the
 // private library), BOOK (book id), VOICE, and for "work" CHAPTERS ("3,7,9")
@@ -15,7 +17,7 @@
 
 import { loadVoice, trimSilence, encodeMp3, toInt16, SAMPLE_RATE } from "./voice.mjs";
 import { planParts } from "../src/plan.js";
-import { readBook, audioFiles, audioBranches, deleteBranch, readBlob, ownBranch, output } from "./library.mjs";
+import { readBook, audioFiles, audioBranches, deleteBranch, readBlob, ownBranch, output, updateLibraryEntry } from "./library.mjs";
 import { mixChapter, LEVELS, levelFile, MIX_VERSION } from "./mix.mjs";
 
 const { BOOK, VOICE = "af_heart" } = process.env;
@@ -141,14 +143,29 @@ async function mix() {
     return clips[mood];
   };
   const branch = ownBranch(process.env.PART);
+  let failed = 0;
   for (const ch of chapters) {
+    try {
+      await mixOne(ch);
+    } catch (err) {
+      // Carry on with the other chapters; the job still reports the failure.
+      failed++;
+      console.error(`chapter ${ch}: ${err.message}`);
+    }
+  }
+  if (failed) {
+    console.error(`${failed} chapter(s) couldn't be mixed`);
+    process.exitCode = 1;
+  }
+
+  async function mixOne(ch) {
     const name = String(ch).padStart(4, "0");
     if (!files[`${name}.mp3`] || !files[`${name}.json`] || !moods?.[ch]) {
       console.log(`chapter ${ch}: no narration yet, skipped`);
-      continue;
+      return;
     }
     const levels = Object.keys(LEVELS).filter((l) => !files[levelFile(name, l)]);
-    if (!levels.length) continue;
+    if (!levels.length) return;
     const started = performance.now();
     const timing = JSON.parse(await readBlob(files[`${name}.json`]));
     const decoded = decoder.decode(new Uint8Array(await readBlob(files[`${name}.mp3`])));
@@ -161,7 +178,7 @@ async function mix() {
     for (const m of new Set(segments.map((s) => s.mood))) songs[m] = await clipsFor(m);
     if (Object.values(songs).some((v) => !v.length)) {
       console.log(`chapter ${ch}: its music isn't composed, skipped`);
-      continue;
+      return;
     }
     const mixed = mixChapter(toInt16(samples), timing.starts, segments, songs, SAMPLE_RATE, levels);
     const out = Object.fromEntries(levels.map((l) => [levelFile(name, l), encodeMp3([mixed[l]], KBPS)]));
@@ -171,8 +188,25 @@ async function mix() {
   }
 }
 
+// A failed run leaves nothing half-made behind. If the narration failed, the
+// book's audio is removed completely and it goes back to "not prepared"; if
+// only the music failed, the music is removed and the narration kept, so the
+// book still plays (and music can be added again from the player).
+async function clean() {
+  const narrationFailed = process.env.NARRATION === "failure";
+  const music = /^(moods|music-.+|mix-.+)$/;
+  const branches = await audioBranches();
+  const doomed = branches.filter((b) => narrationFailed || music.test(b.ref.split("/").pop()));
+  console.log(`${narrationFailed ? "narration" : "music"} failed: removing ${doomed.length} of ${branches.length} audio parts`);
+  for (const b of doomed) await deleteBranch(b.ref);
+  if (narrationFailed) {
+    await updateLibraryEntry({ voice: null, ready: false, startedAt: 0, eta: null, failedAt: Date.now(), audioAt: Date.now() });
+  }
+}
+
 const mode = process.argv[2];
 if (mode === "plan") await plan();
 else if (mode === "work") await work();
 else if (mode === "mix") await mix();
+else if (mode === "clean") await clean();
 else if (mode) throw new Error(`Unknown mode ${mode}`);
