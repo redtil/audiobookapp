@@ -132,52 +132,147 @@ async function epubToc(zip, opf, items, xml) {
 
 // ---------- PDF ----------
 
-async function pdfPageText(page) {
+// A page's text as lines: { text, size, x, end, y, pos } where pos is how far
+// down the page the line sits (0 top, 1 bottom). Small raised numbers
+// (footnote markers) are left out.
+async function pdfPageLines(page) {
   const { items } = await page.getTextContent();
-  let out = "";
-  let last = null; // { y, end, charWidth } of the previous piece of text
+  const [, bottom, , top] = page.view;
+  const lines = [];
+  let cur = null;
+  let last = null; // { end, charWidth } of the previous piece on this line
   for (const it of items) {
     if (!("str" in it) || !it.str) continue;
     const x = it.transform[4];
     const y = it.transform[5];
+    const size = Math.abs(it.transform[3]) || it.height || 12;
     const charWidth = it.width / Math.max(1, it.str.length);
-    if (last && Math.abs(y - last.y) > 2) {
-      const size = it.height || Math.abs(it.transform[3]) || 12;
-      out += Math.abs(last.y - y) > size * 1.8 ? "\n\n" : "\n";
-    } else if (last && !/\s$/.test(out) && !/^\s/.test(it.str)) {
+    const dy = cur ? Math.abs(y - cur.y) : Infinity;
+    // Smaller text slightly above or below the line: a superscript.
+    const raised = cur && size < 0.8 * cur.size && dy > 1 && dy < 0.7 * cur.size;
+    if (raised) {
+      if (/^[\s\d*†‡§¶,\-–]+$/.test(it.str)) continue; // a footnote marker
+    } else if (!cur || dy > Math.max(2, 0.4 * Math.min(size, cur.size))) {
+      cur = { text: "", size, sizes: {}, x, end: x, y, pos: 1 - (y - bottom) / Math.max(1, top - bottom) };
+      lines.push(cur);
+      last = null;
+    }
+    if (!it.str.trim()) {
+      if (cur.text && !/\s$/.test(cur.text)) cur.text += " ";
+      continue;
+    }
+    if (last && !/\s$/.test(cur.text) && !/^\s/.test(it.str)) {
       // Many PDFs (scanned books with a text layer especially) place each
       // word separately without a space character: the gap is the space.
       // A gap of a third of a letter or more (or jumping back) is a word break.
       const gap = x - last.end;
-      if (gap > 0.3 * Math.min(charWidth, last.charWidth) || gap < -charWidth) out += " ";
+      if (gap > 0.3 * Math.min(charWidth, last.charWidth) || gap < -charWidth) cur.text += " ";
     }
-    out += it.str;
-    last = { y, end: x + it.width, charWidth };
+    cur.text += it.str;
+    if (!raised) {
+      const k = Math.round(size * 2) / 2;
+      cur.sizes[k] = (cur.sizes[k] || 0) + it.str.length;
+      cur.x = Math.min(cur.x, x);
+    }
+    cur.end = Math.max(cur.end, x + it.width);
+    last = { end: x + it.width, charWidth };
   }
-  return out;
+  for (const l of lines) {
+    // The line's size is the size most of its letters have.
+    l.size = +Object.entries(l.sizes).sort((a, b) => b[1] - a[1])[0]?.[0] || l.size;
+    l.text = l.text.trim();
+  }
+  return lines.filter((l) => l.text);
 }
 
-// Lines that repeat on most pages (running headers, footers, page numbers)
-// shouldn't be read aloud on every page.
-function dropRepeatedLines(pages) {
+const mostCommon = (values) => {
   const counts = new Map();
-  const key = (l) => l.trim().replace(/\d+/g, "#");
-  for (const p of pages) {
-    const lines = p.split("\n").filter((l) => l.trim());
-    for (const l of new Set([...lines.slice(0, 2), ...lines.slice(-2)].map(key))) {
-      counts.set(l, (counts.get(l) || 0) + 1);
+  for (const [v, w] of values) counts.set(v, (counts.get(v) || 0) + w);
+  return [...counts].sort((a, b) => b[1] - a[1])[0]?.[0];
+};
+const percentile = (xs, q) => (xs.length ? [...xs].sort((a, b) => a - b)[Math.min(xs.length - 1, Math.floor(xs.length * q))] : 0);
+const median = (xs) => percentile(xs, 0.5);
+
+// What ordinary text looks like in this book: its size, line spacing, left
+// edge and right edge.
+function bodyLayout(pages) {
+  const all = pages.flat();
+  const size = mostCommon(all.map((l) => [l.size, l.text.length])) || 12;
+  const body = (l) => Math.abs(l.size - size) < 0.6;
+  const gaps = [];
+  for (const lines of pages) {
+    for (let i = 1; i < lines.length; i++) {
+      const gap = lines[i - 1].y - lines[i].y;
+      if (body(lines[i]) && body(lines[i - 1]) && gap > 0 && gap < 4 * size) gaps.push(gap);
     }
   }
-  const limit = Math.max(3, pages.length * 0.4);
-  return pages.map((p) => {
-    const lines = p.split("\n");
-    const edge = new Set();
-    const nonEmpty = lines.map((l, i) => (l.trim() ? i : -1)).filter((i) => i >= 0);
-    [...nonEmpty.slice(0, 2), ...nonEmpty.slice(-2)].forEach((i) => edge.add(i));
-    return lines
-      .filter((l, i) => !(edge.has(i) && (counts.get(key(l)) >= limit || /^\s*\d{1,4}\s*$/.test(l))))
-      .join("\n");
+  const bodyLines = all.filter(body);
+  return {
+    size,
+    body,
+    gap: median(gaps) || size * 1.2,
+    left: mostCommon(bodyLines.map((l) => [Math.round(l.x), 1])) ?? 0,
+    right: percentile(bodyLines.map((l) => l.end), 0.9) || 0,
+  };
+}
+
+const PAGE_NUMBER = /^(page\s+)?[-–—(\[]?\s*(\d{1,4}|[ivxlcdm]{1,7})\s*[-–—)\]]?$/i;
+
+// Leaves out what isn't the book's text: page numbers, footnotes at the foot
+// of the page (smaller than the text), and running headers and footers.
+function dropPageFurniture(pages, layout) {
+  pages = pages.map((lines) => {
+    lines = lines.filter((l, i) =>
+      !((l.pos < 0.12 || l.pos > 0.86 || i === 0 || i === lines.length - 1) && PAGE_NUMBER.test(l.text)));
+    // Footnotes: the smaller lines at the bottom, below the last line of text.
+    let cut = lines.length;
+    while (cut > 0 && lines[cut - 1].pos > 0.45 && lines[cut - 1].size < layout.size * 0.9) cut--;
+    return lines.slice(0, cut);
   });
+  // Lines repeating near the top or bottom of many pages (odd and even pages
+  // often differ, so each are counted on their own).
+  const key = (l) => l.text.replace(/\d+/g, "#").toLowerCase();
+  const edges = (lines) => [...lines.slice(0, 2), ...lines.slice(-2)].filter((l) =>
+    l.pos < 0.12 || l.pos > 0.88 || ((l === lines[0] || l === lines.at(-1)) && !ENDS_SENTENCE.test(l.text)));
+  const counts = [new Map(), new Map(), new Map()]; // even pages, odd pages, all
+  pages.forEach((lines, n) => {
+    for (const k of new Set(edges(lines).map(key))) {
+      for (const c of [counts[n % 2], counts[2]]) c.set(k, (c.get(k) || 0) + 1);
+    }
+  });
+  const repeats = (k, n) =>
+    counts[2].get(k) >= Math.max(3, pages.length * 0.4) || counts[n % 2].get(k) >= Math.max(2, (pages.length / 2) * 0.5);
+  return pages.map((lines, n) => {
+    const edge = new Set(edges(lines));
+    return lines.filter((l) => !(edge.has(l) && repeats(key(l), n)));
+  });
+}
+
+const ENDS_SENTENCE = /[.!?…:;"”’)\]]$/;
+
+// Whether line b starts a new paragraph after line a.
+function newParagraph(a, b, layout, samePage) {
+  const startsLower = /^[\p{Ll}]/u.test(b.text);
+  const heading = (l) => l.size > layout.size * 1.12;
+  if (heading(a) !== heading(b) || (heading(a) && heading(b) && samePage && a.y - b.y > a.size * 1.8)) return true;
+  if (!ENDS_SENTENCE.test(a.text) && startsLower) return false; // mid-sentence
+  if (samePage && a.y - b.y > layout.gap * 1.45) return true; // a gap between paragraphs
+  const short = (l) => layout.right && l.end < layout.right - layout.size * 3;
+  if (ENDS_SENTENCE.test(a.text) && short(b) && !ENDS_SENTENCE.test(b.text)) return true; // a heading
+  if (b.x > layout.left + layout.size * 0.8 && b.x < layout.left + layout.size * 8) return true; // indented
+  if (short(a)) return true; // the line before stopped short
+  return false;
+}
+
+// Lines from..to as text, paragraphs separated by blank lines.
+function linesText(flat, from, to, layout) {
+  let text = "";
+  for (let i = from; i < to; i++) {
+    const l = flat[i];
+    if (i > from) text += newParagraph(flat[i - 1], l, layout, flat[i - 1].page === l.page) ? "\n\n" : "\n";
+    text += l.text;
+  }
+  return text;
 }
 
 async function readPdf(file) {
@@ -186,36 +281,48 @@ async function readPdf(file) {
   const title = meta?.info?.Title?.trim() || file.name.replace(/\.pdf$/i, "");
 
   let pages = [];
-  for (let n = 1; n <= pdf.numPages; n++) pages.push(await pdfPageText(await pdf.getPage(n)));
-  pages = dropRepeatedLines(pages);
-  if (!pages.join("").trim()) {
+  for (let n = 1; n <= pdf.numPages; n++) pages.push(await pdfPageLines(await pdf.getPage(n)));
+  if (!pages.flat().length) {
     throw new Error("This PDF has no text layer (it's probably scanned pages), so it can't be read aloud.");
   }
+  const layout = bodyLayout(pages);
+  pages = dropPageFurniture(pages, layout);
+  // Every line of the book in order, and where each page's lines begin.
+  const flat = pages.flatMap((lines, page) => lines.map((l) => ({ ...l, page })));
+  const pageStart = [];
+  pages.reduce((at, lines, n) => ((pageStart[n] = at), at + lines.length), 0);
+  pageStart.push(flat.length);
 
+  // Chapters from the PDF's bookmarks; a bookmark usually points at a spot
+  // on the page, so a chapter can start halfway down one.
   let marks = [];
   try {
     for (const entry of (await pdf.getOutline()) || []) {
       let dest = entry.dest;
       if (typeof dest === "string") dest = await pdf.getDestination(dest);
-      if (Array.isArray(dest)) marks.push({ title: entry.title.trim(), page: await pdf.getPageIndex(dest[0]) });
+      if (!Array.isArray(dest)) continue;
+      const page = await pdf.getPageIndex(dest[0]);
+      const top = dest[1]?.name === "XYZ" && typeof dest[3] === "number" ? dest[3] : null;
+      const lines = pages[page] || [];
+      const k = top == null ? 0 : lines.findIndex((l) => l.y <= top + 2);
+      marks.push({ title: entry.title.trim(), at: pageStart[page] + (k < 0 ? lines.length : k) });
     }
   } catch {
     marks = [];
   }
-  marks = marks.filter((m, i, a) => i === 0 || m.page > a[i - 1].page);
+  marks = marks.filter((m, i, a) => i === 0 || m.at > a[i - 1].at);
 
   const chapters = [];
   if (marks.length >= 2) {
-    if (marks[0].page > 0) marks.unshift({ title: "Opening pages", page: 0 });
+    if (marks[0].at > 0) marks.unshift({ title: "Opening pages", at: 0 });
     marks.forEach((m, i) => {
-      const end = marks[i + 1]?.page ?? pages.length;
-      chapters.push({ title: m.title, text: tidy(pages.slice(m.page, end).join("\n\n")) });
+      chapters.push({ title: m.title, text: tidy(linesText(flat, m.at, marks[i + 1]?.at ?? flat.length, layout)) });
     });
   } else {
     const per = 10;
     for (let p = 0; p < pages.length; p += per) {
       const end = Math.min(p + per, pages.length);
-      chapters.push({ title: `Pages ${p + 1}–${end}`, text: tidy(pages.slice(p, end).join("\n\n")) });
+      chapters.push({ title: `Pages ${p + 1}–${end}`, text: tidy(linesText(flat, pageStart[p], pageStart[end], layout)) });
     }
   }
   return { title, chapters };
@@ -230,7 +337,7 @@ function tidy(raw, html = false) {
     .replace(/[ \t ]+/g, " ")
     .split(/\n\s*\n/)
     .map((p) => p.replace(/\s*\n\s*/g, " ").trim())
-    .filter((p) => /[\p{L}\p{N}]/u.test(p))
+    .filter((p) => /[\p{L}\p{N}]/u.test(p) && (html || !PAGE_NUMBER.test(p)))
     .join("\n\n");
 }
 
